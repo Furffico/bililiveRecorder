@@ -2,9 +2,10 @@ import requests
 import os
 from datetime import datetime
 import threading
-from time import sleep
+import time
 from flv_checker import Flv
 from configparser import ConfigParser
+import signal
 
 
 def dataunitConv(size):  # n in bytes
@@ -58,7 +59,7 @@ class LiveRoom():
     def getLiveUrl(self):
         # self.updateStatus()
         if not self.onair:
-            print('当前没有在直播')
+            self.log('当前没有在直播')
             return None
 
         response = requests.get(
@@ -84,7 +85,7 @@ class LiveRoom():
         ).json()
         url = response['data']['durl'][0]['url']
         realqn = response['data']['current_qn']
-        print("申请清晰度 %s的链接，得到清晰度 %d的链接" % (qn, realqn))
+        self.log("申请清晰度 %s的链接，得到清晰度 %d的链接" % (qn, realqn))
         return url
 
     def recordthis(self):
@@ -102,20 +103,29 @@ class LiveRoom():
             return None
         self.recordThread.start()
 
-    def check(self):
-        now = datetime.now()
-        if (now-self.lastUpdate).seconds > self.updateInterval:
-            print(f'[{now}][id:{self.id}] updating status.')
-            self.updateStatus()
-            print(f'[{datetime.now()}][id:{self.id}] status updated.')
-            if self.onair:
-                self.recordthis()
-                print(f'[{datetime.now()}][id:{self.id}] start recording.')
+    def log(self, *texts):
+        print('[{}][id:{}]'.format(datetime.now(), self.id), *texts)
+
+    def report(self):
+        if self.recordThread:
+            if self.recordThread.isRecording():
+                self.log('{} downloaded.'.format(
+                    dataunitConv(self.recordThread.downloaded)))
+            else:
+                self.recordThread = None
+        else:
+            now = datetime.now()
+            if (now-self.lastUpdate).seconds > self.updateInterval:
+                self.log('updating status.')
+                self.updateStatus()
+                self.log('status updated.')
+                if self.onair:
+                    self.recordthis()
+                    self.log('start recording.')
 
 
-class Monitor(threading.Thread):
+class Monitor:
     def __init__(self, rooms):
-        super().__init__()
         self.rooms = rooms
         self.running = True
 
@@ -123,21 +133,21 @@ class Monitor(threading.Thread):
         print('monitor thread running')
         stopped = []
         while self.running:
+            start = datetime.now()
             for room in self.rooms:
-                if room.recordThread:
-                    th = room.recordThread
-                    if th.isRecording():
-                        print('[{}][id:{}] {} downloaded.'.format(
-                            datetime.now(), th.roomid, dataunitConv(th.downloaded)))
-                    else:
-                        room.recordThread = None
-                else:
-                    room.check()
-            sleep(10)
+                room.report()
+            while self.running and (datetime.now()-start).seconds < 10:
+                time.sleep(0.05)
         print('monitor thread stopped')
 
-    def terminate(self):
+    def shutdown(self, signalnum, frame):
         self.running = False
+        for i in self.rooms:
+            if i.recordThread:
+                i.recordThread.stopRecording()
+        for i in self.rooms:
+            if i.recordThread:
+                i.recordThread.join()
 
 
 class Recorder(threading.Thread):
@@ -152,16 +162,15 @@ class Recorder(threading.Thread):
         self.savedir = savedir
 
     def run(self):
-        print('start running recording thread')
+        self.log('start running recording thread')
         try:
             self.record()
         except e:
-            print('exception occurred:', e)
-        print('recording thread terminated')
+            self.log('exception occurred:', e)
+        self.log('recording thread terminated')
 
     def record(self):
         self._downloading = True
-        print('Recording')
 
         temppath = os.path.join(config['BASIC']['temppath'], self.filename)
         with open(temppath, "wb") as file:
@@ -186,24 +195,27 @@ class Recorder(threading.Thread):
             except e:
                 pass
             finally:
-                print('停止录制')
+                self.log('停止录制')
                 response.close()
                 self._downloading = False
 
             saveto = os.path.join(self.savedir, self.filename.format(
                 endtime=datetime.now().strftime('%H%M%S')))
-            print("正在校准时间戳")
+            self.log("正在校准时间戳")
             flv = Flv(temppath, saveto, False)
             flv.check()
             os.remove(temppath)
-            print('thread quitted')
 
     def isRecording(self):
         return self._downloading
 
     def stopRecording(self):
-        print('Exiting...')
+        self.log('Exiting...')
         self._downloading = False
+
+    def log(self, *texts):
+        print('[{}][id:{}][recorder]'.format(
+            datetime.now(), self.roomid), *texts)
 
 
 def readconfig(path='config.ini'):
@@ -213,22 +225,18 @@ def readconfig(path='config.ini'):
 
 
 if __name__ == "__main__":
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
     readconfig('config.ini')
     r = []
     for key in config.sections():
         if key == 'BASIC':
             continue
         item = config[key]
-        if item.getboolean('activated',True):
-            r.append(LiveRoom(int(item.get('roomid')),item.get('savefolder', key)))
+        if item.getboolean('activated', True):
+            r.append(LiveRoom(int(item.get('roomid')),
+                              item.get('savefolder', key)))
     monitor = Monitor(r)
-    try:
-        monitor.run()
-    except KeyboardInterrupt:
-        pass
-    for i in r:
-        if i.recordThread:
-            i.recordThread.stopRecording()
-    for i in r:
-        if i.recordThread:
-            i.recordThread.join()
+    for sig in [signal.SIGINT, signal.SIGHUP, signal.SIGTERM]:
+        signal.signal(sig, monitor.shutdown)
+    monitor.run()
+    monitor.shutdown(None, None)
