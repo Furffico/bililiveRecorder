@@ -1,15 +1,18 @@
-import requests
+import logging
 import os
-from datetime import datetime
+import re
+import signal
 import threading
 import time
-from flv_checker import Flv
 from configparser import ConfigParser
-import signal
-import re
-import logging
+from datetime import datetime
 
-def dataunitConv(size):  # n in bytes
+import requests
+
+from flv_checker import Flv
+
+
+def dataunitConv(size):  # size in bytes
     if not size:
         return '0'
     n = size
@@ -40,8 +43,10 @@ class LiveRoom():
         self.lastUpdate = datetime(2000, 1, 1, 10, 0, 0)
         self.savefolder = savefolder or 'common'
         self.baseUpdateInterval = updateInterval
+        self.username = None
 
     def updateStatus(self):
+        # 获取房间基本信息及是否开播
         response = requests.get(
             "https://api.live.bilibili.com/room/v1/Room/get_info?id={}".format(
                 self.id),
@@ -57,19 +62,22 @@ class LiveRoom():
         self.roomInfo['update_time'] = datetime.now()
         self.lastUpdate = self.roomInfo['update_time']
 
-    def getLiveUrl(self):
-        # self.updateStatus()
-        if not self.onair:
-            logger.info(f'room{self.id} 当前没有在直播')
-            return None
-
+    def getUserName(self):
         response = requests.get(
             "https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room?roomid={}".format(
                 self.id),
             timeout=10, headers=self.headers
         ).json()
         self.roomInfo['user_name'] = response['data']['info']['uname']
+        self.username = self.roomInfo['user_name']
+        logger.info(f'room{self.id} 获得直播间对应主播的用户名：{self.username}')
 
+    def getLiveUrl(self):
+        if not self.onair:
+            logger.info(f'room{self.id} 当前没有在直播')
+            return None
+
+        # 推流码率
         rates = requests.get(
             "https://api.live.bilibili.com/room/v1/Room/playUrl?cid={}&quality=0&platform=web".format(
                 self.roomInfo['room_id']),
@@ -79,6 +87,7 @@ class LiveRoom():
             rate['qn']: rate['desc'] for rate in rates}
         qn = max(self.roomInfo['live_rates'])
 
+        # 推流链接
         response = requests.get(
             "https://api.live.bilibili.com/room/v1/Room/playUrl?cid={}&quality={}&platform=web".format(
                 self.roomInfo['room_id'], qn),
@@ -92,44 +101,53 @@ class LiveRoom():
     def recordthis(self):
         if self.onair:
             url = self.getLiveUrl()
+            if not self.username:
+                self.getUserName()
             savepath = os.path.join(
                 config['BASIC']['saveroot'], self.savefolder)
-            if not (os.path.exists(savepath) and os.path.isdir(savepath)):
+            if not os.path.exists(savepath) or not os.path.isdir(savepath):
                 os.mkdir(savepath)
-            filename = '{room_id}{user_name}-{time}-{endtime}-{title}'.format(
+            filename = '{room_id}-{user_name}-{time}-{endtime}-{title}'.format(
                 **self.roomInfo, time=datetime.now().strftime('%y%m%d%H%M%S'), endtime='{endtime}')
-            filename=re.sub(r'[\<\>\:\"\\\'\\\/\|\?\*\.]','',filename)+'.flv'
+            # 防止标题和用户名中含有windows路径的非法字符
+            filename = re.sub(
+                r'[\<\>\:\"\\\'\\\/\|\?\*\.]', '', filename)+'.flv'
             self.recordThread = Recorder(
                 self.id, self.roomInfo, url, filename, savepath)
+            self.recordThread.start()
         else:
             return None
-        self.recordThread.start()
 
     def report(self):
         if self.recordThread:
             if self.recordThread.isRecording():
-                logger.info('room{}: {} downloaded.'.format(self.id,
-                    dataunitConv(self.recordThread.downloaded)))
+                delta = datetime.now()-self.lastUpdate
+                if delta.seconds>60 or delta.days > 0:
+                    logger.info('room{}: {} downloaded.'.format(self.id,
+                                                            dataunitConv(self.recordThread.downloaded)))
+                    self.lastUpdate=datetime.now()
             else:
-                self.recordThread = None
+                self.recordThread = None  # 如果录制已停止则不再监控recorder
         else:
-            now = datetime.now()
-            if (now-self.lastUpdate).seconds > self.updateInterval:
+            delta = datetime.now()-self.lastUpdate
+            if delta.seconds > self.updateInterval or delta.days > 0:
                 logger.info(f'room{self.id}: updating status.')
                 self.updateStatus()
                 logger.info(f'room{self.id}: status updated.')
                 if self.onair:
-                    self.recordthis()
                     logger.info(f'room{self.id}: start recording.')
-    
+                    self.recordthis()
+
     @property
     def updateInterval(self):
-        now=datetime.now()   
-        if now.weekday()<=4: #周一到周五
-            if 2<=now.hour<=19:
+        if config['BASIC'].getboolean('overrideschedule',False):
+            return self.baseUpdateInterval
+        now = datetime.now()
+        if now.weekday() <= 4:  # 周一到周五
+            if 2 <= now.hour <= 19:
                 return self.baseUpdateInterval*4
-        else:               #周六周日
-            if 4<=now.hour<=14:
+        else:  # 周六周日
+            if 4 <= now.hour <= 14:
                 return self.baseUpdateInterval*2
         return self.baseUpdateInterval
 
@@ -143,23 +161,24 @@ class Monitor:
         logger.info('monitor thread running')
         stopped = []
         while self.running:
-            start = datetime.now()
             for room in self.rooms:
-                room.report()
-            while self.running and (datetime.now()-start).seconds < 10:
-                time.sleep(0.05)
+                try:
+                    room.report()
+                except Exception as e:
+                    logger.exception(f'room{room.id}: exception occurred')
+            time.sleep(0.05)
         logger.info('monitor thread stopped')
 
     def shutdown(self, signalnum, frame):
         self.running = False
-        logging.info('Program terminating')
+        logger.info('Program terminating')
         for i in self.rooms:
             if i.recordThread:
                 i.recordThread.stopRecording()
         for i in self.rooms:
             if i.recordThread:
                 i.recordThread.join()
-        logging.info('Program terminated')
+        logger.info('Program terminated')
 
 
 class Recorder(threading.Thread):
@@ -177,7 +196,7 @@ class Recorder(threading.Thread):
         logger.info(f'recorder{self.roomid}: start running recording thread')
         try:
             self.record()
-        except e:
+        except Exception as e:
             logger.exception(f'recorder{self.roomid}: exception occurred')
         logger.info(f'recorder{self.roomid}: recording thread terminated')
 
@@ -204,7 +223,7 @@ class Recorder(threading.Thread):
                     if data:
                         file.write(data)
                         self.downloaded += len(data)
-            except e:
+            except Exception as e:
                 logger.exception(f'recorder{self.roomid}: exception occurred')
             finally:
                 logger.info(f'recorder{self.roomid}: 停止录制')
@@ -231,34 +250,41 @@ def readconfig(path='config.ini'):
     config = ConfigParser()
     config.read(path)
 
-def setlogger(logpath='info.log'):
-    global logger
-    with open(logpath,'a') as f:
-        f.write('\n\n\n')
-    logger=logging.getLogger('recorder')
-    logger.setLevel(logging.DEBUG)
-    handler1 = logging.StreamHandler()
-    handler2 = logging.FileHandler(filename=logpath)
-    formatter = logging.Formatter("[%(asctime)s][%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    handler1.setFormatter(formatter)
-    handler2.setFormatter(formatter)
-    handler1.setLevel(logging.WARNING)
-    handler2.setLevel(logging.INFO)
-    logger.addHandler(handler1)
-    logger.addHandler(handler2)
-
-if __name__ == "__main__":
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    setlogger()
-    logger.info('Program started')
-    readconfig('config.ini')
     r = []
     for key in config.sections():
         if key == 'BASIC':
             continue
         item = config[key]
         if item.getboolean('activated', True):
-            r.append(LiveRoom(item.getint('roomid'),item.get('savefolder', key),item.getint('updateinterval',120)))
+            r.append(LiveRoom(item.getint('roomid'), item.get(
+                'savefolder', key), item.getint('updateinterval', 120)))
+    return r
+
+
+def setlogger(logpath='info.log'):
+    global logger
+    with open(logpath, 'a') as f:
+        f.write('\n\n\n')
+    logger = logging.getLogger('recorder')
+    logger.setLevel(logging.DEBUG)
+    handler1 = logging.StreamHandler()
+    handler2 = logging.FileHandler(filename=logpath)
+    formatter = logging.Formatter(
+        "[%(asctime)s][%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    handler1.setFormatter(formatter)
+    handler2.setFormatter(formatter)
+    handler1.setLevel(logging.WARNING)
+    handler2.setLevel(logging.INFO)
+    logger.addHandler(handler1)
+    logger.addHandler(handler2)
+    logger.info('Program started')
+
+
+if __name__ == "__main__":
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    setlogger()
+    r = readconfig('config.ini')
+
     monitor = Monitor(r)
     for sig in [signal.SIGINT, signal.SIGHUP, signal.SIGTERM]:
         signal.signal(sig, monitor.shutdown)
