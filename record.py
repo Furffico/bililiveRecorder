@@ -289,9 +289,13 @@ if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     setlogger()
     r = readconfig('config.ini')
+    if not r:
+        logger.warning('NO activated room found in config.ini')
+        quit()
 
     monitor = Monitor(r)
     for sig in [signal.SIGINT, signal.SIGHUP, signal.SIGTERM]:
         signal.signal(sig, monitor.shutdown)
     monitor.run()
     monitor.shutdown(None, None)
+    
