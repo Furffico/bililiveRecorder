@@ -33,12 +33,11 @@ class LiveRoom():
         self.onair = False
         self.recordThread = None
         self._headers = {
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept-Language': 'zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
             'Origin': 'https://live.bilibili.com',
             'Referer': 'https://live.bilibili.com/blanc/{}'.format(self.id),
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0'
         }
         self._lastUpdate = datetime(2000, 1, 1, 10, 0, 0)
         self._savefolder = savefolder or 'common'
@@ -63,7 +62,6 @@ class LiveRoom():
                 self.id),
             timeout=10, headers=self._headers
         ).json()
-
         self._roomInfo = {
             key: response['data'][key]
             for key in ['room_id', 'live_status', 'title', 'description', 'uid']
@@ -128,6 +126,7 @@ class LiveRoom():
             delta = datetime.now()-self._lastUpdate
             if delta.seconds > self.updateInterval or delta.days > 0:
                 logger.info(f'room{self.id}: updating status.')
+                self._lastUpdate=datetime.now()
                 self._updateStatus()
                 logger.info(f'room{self.id}: status updated.')
                 if self.onair:
