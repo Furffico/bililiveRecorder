@@ -6,6 +6,8 @@ import threading
 import time
 from configparser import ConfigParser
 from datetime import datetime
+from queue import Queue
+import pickle
 
 import requests
 
@@ -28,7 +30,7 @@ def dataunitConv(size):  # size in bytes
 
 
 class LiveRoom():
-    def __init__(self, roomid, savefolder=None, updateInterval=60):
+    def __init__(self, roomid, code, savefolder=None, updateInterval=60):
         self.id = roomid
         self.onair = False
         self.recordThread = None
@@ -42,9 +44,14 @@ class LiveRoom():
         self._lastUpdate = datetime(2000, 1, 1, 10, 0, 0)
         self._savefolder = savefolder or 'common'
         self._baseUpdateInterval = updateInterval
-        self._roomInfo={}
-        self._username=None
-    
+        global OrgHistory
+        if code not in OrgHistory:
+            OrgHistory[code] = [0]*144
+        self.history = OrgHistory[code]
+        self._roomInfo = {}
+        self.code = code
+        self._username = None
+
     def _getUserName(self):
         # 获取用户名
         response = requests.get(
@@ -107,26 +114,28 @@ class LiveRoom():
         if not os.path.exists(savepath) or not os.path.isdir(savepath):
             os.mkdir(savepath)
         filename = '{room_id}-{username}-{time}-{endtime}-{title}'.format(
-            **self._roomInfo,username=self._username,time=datetime.now().strftime('%y%m%d%H%M%S'), endtime='{endtime}',)
+            **self._roomInfo, username=self._username, time=datetime.now().strftime('%y%m%d%H%M%S'), endtime='{endtime}',)
         # 防止标题和用户名中含有windows路径的非法字符
         filename = re.sub(r'[\<\>\:\"\\\'\\\/\|\?\*\.]', '', filename)+'.flv'
-        self.recordThread = Recorder(self.id, self._roomInfo, url, filename, savepath)
+        self.recordThread = Recorder(
+            self.id, self._roomInfo, url, filename, savepath, self.code)
         self.recordThread.start()
 
     def report(self):
         if self.recordThread:
             if self.recordThread.isRecording():
                 delta = datetime.now()-self._lastUpdate
-                if delta.seconds>60 or delta.days > 0:
-                    logger.info('room{}: {} downloaded.'.format(self.id,dataunitConv(self.recordThread.downloaded)))
-                    self._lastUpdate=datetime.now()
+                if delta.seconds > 60 or delta.days > 0:
+                    logger.info('room{}: {} downloaded.'.format(
+                        self.id, dataunitConv(self.recordThread.downloaded)))
+                    self._lastUpdate = datetime.now()
             else:
                 self.recordThread = None  # 如果录制已停止则不再监控recorder
         else:
             delta = datetime.now()-self._lastUpdate
             if delta.seconds > self.updateInterval or delta.days > 0:
                 logger.info(f'room{self.id}: updating status.')
-                self._lastUpdate=datetime.now()
+                self._lastUpdate = datetime.now()
                 self._updateStatus()
                 logger.info(f'room{self.id}: status updated.')
                 if self.onair:
@@ -135,16 +144,13 @@ class LiveRoom():
 
     @property
     def updateInterval(self):
-        if config['BASIC'].getboolean('overrideschedule',False):
+        if config['BASIC'].getboolean('overrideschedule', False):
             return self._baseUpdateInterval
-        now = datetime.now()
-        if now.weekday() <= 4:  # 周一到周五
-            if 2 <= now.hour <= 19:
-                return self._baseUpdateInterval*4
-        else:  # 周六周日
-            if 4 <= now.hour <= 14:
-                return self._baseUpdateInterval*2
-        return self._baseUpdateInterval
+        t = dividePeriod(time.time())
+        interval = 600*(self._baseUpdateInterval /
+                        600)**(self.history[t]/max(1, *self.history))
+        # print(interval)
+        return interval
 
 
 class Monitor:
@@ -161,25 +167,31 @@ class Monitor:
                     room.report()
                 except Exception as e:
                     logger.exception(f'room{room.id}: exception occurred')
-            time.sleep(0.05)
+            time.sleep(0.1)
         logger.info('monitor thread stopped')
 
     def shutdown(self, signalnum, frame):
         self.running = False
         logger.info('Program terminating')
-        rt=list(Recorder.runningThreads.values())
-        for i in rt:
-            i.stopRecording()
-        logger.info('Waiting for timestamp adjustments to complete')
-        for i in rt:
-            i.join()
+        FlvCheckThread.onexit()
+        Recorder.onexit()
+
+        logger.info('Storing history')
+        global OrgHistory
+        with open(config['BASIC']['history'], 'wb') as f:
+            pickle.dump(OrgHistory, f)
+        l = list(FlvCheckThread.getQueue())
+        logger.info('未完成的时间戳调整任务：\n' +
+                    '\n'.join((f"    {i} -> {j}" for i, j in l)))
+        with open('./queue.pkl', 'wb') as f:
+            pickle.dump(l, f)
         logger.info('Program terminated')
 
 
 class Recorder(threading.Thread):
-    runningThreads={}
-    
-    def __init__(self, roomid, roomInfo, url, filename, savedir):
+    runningThreads = {}
+
+    def __init__(self, roomid, roomInfo, url, filename, savedir, code):
         super().__init__()
         self.roomid = roomid
         self.downloaded = 0
@@ -187,27 +199,31 @@ class Recorder(threading.Thread):
         self._filename = filename
         self._savedir = savedir
         self._downloading = False
-    
+        self.code = code
+
     def run(self):
         logger.info(f'recorder{self.roomid}: start running recording thread')
-        self._addself()
+        Recorder.runningThreads[(self.roomid, self._filename)] = self
         try:
             self._record()
         except Exception as e:
             logger.exception(f'recorder{self.roomid}: exception occurred')
-        self._removeself()
+        del Recorder.runningThreads[(self.roomid, self._filename)]
         logger.info(f'recorder{self.roomid}: recording thread terminated')
-    
-    def _addself(self):
-        Recorder.runningThreads[(self.roomid,self._filename)]=self
-    
-    def _removeself(self):
-        del Recorder.runningThreads[(self.roomid,self._filename)]
-    
+
+    @classmethod
+    def onexit(cls):
+        rt = list(cls.runningThreads.values())
+        for i in rt:
+            i.stopRecording()
+        for i in rt:
+            i.join()
+
     def _record(self):
         self._downloading = True
 
         temppath = os.path.join(config['BASIC']['temppath'], self._filename)
+        starttime = datetime.now()
         with open(temppath, "wb") as file:
             response = requests.get(
                 self._url, stream=True,
@@ -234,12 +250,17 @@ class Recorder(threading.Thread):
                 response.close()
                 self._downloading = False
 
+            st = dividePeriod(starttime.timestamp())
+            end = dividePeriod(time.time())
+            if st > end:
+                end += 144
+            for i in range(st, end+1):
+                OrgHistory[self.code][i % 144] += 1
+
             saveto = os.path.join(self._savedir, self._filename.format(
                 endtime=datetime.now().strftime('%H%M%S')))
-            logger.info(f'recorder{self.roomid}: 正在校准时间戳')
-            flv = Flv(temppath, saveto, False)
-            flv.check()
-            os.remove(temppath)
+            logger.info(f'recorder{self.roomid}: 添加任务至时间戳校准队列')
+            FlvCheckThread.addTask(temppath, saveto)
 
     def isRecording(self):
         return self._downloading
@@ -249,23 +270,106 @@ class Recorder(threading.Thread):
         self._downloading = False
 
 
+class FlvCheckThread(threading.Thread):
+    q = Queue()
+    threads = []
+    blocked = False
+
+    def __init__(self):
+        super().__init__()
+        self.threads.append(self)
+        self.flv = None
+
+    def run(self):
+        if self.blocked:
+            return
+        logger.info(f'时间戳校准进程已启动')
+        while not self.blocked and not self.q.empty():
+            temppath, saveto = self.q.get()
+            self.flv = Flv(temppath, saveto)
+            try:
+                self.flv.check()
+            except Exception as e:
+                logger.info(f'Error occurred while processing {temppath}: {e}')
+            else:
+                if self.flv.keepRunning:
+                    os.remove(temppath)
+                    self.q.task_done()
+                else:
+                    os.remove(saveto)
+                    self.q.put((temppath, saveto))
+        logger.info(f'时间戳校准进程结束')
+
+    @classmethod
+    def addTask(cls, temppath, saveto):
+        cls.q.put((temppath, saveto))
+        if not cls.blocked:
+            for th in cls.threads:
+                if not th.is_alive():
+                    th.start()
+                    break
+
+    @classmethod
+    def onexit(cls):
+        cls.blocked = True
+        for th in cls.threads:
+            if th.flv:
+                th.flv.keepRunning = False
+        for th in cls.threads:
+            if th.is_alive():
+                th.join()
+
+    @classmethod
+    def getQueue(cls):
+        while not cls.q.empty():
+            yield cls.q.get()
+
+
+def dividePeriod(dt):
+    return int(dt) % 86400//600
+
+
 def readconfig(path='config.ini'):
-    global config
+    global config, OrgHistory
     config = ConfigParser()
     config.read(path)
 
+    # 读取开播历史
+    hispath = config['BASIC'].get('history', None)
+    if hispath and os.path.isfile(hispath):
+        with open(hispath, 'rb') as f:
+            OrgHistory = pickle.load(f)
+    else:
+        OrgHistory = {}
+
+    # 创建时间戳校准进程
+    for _ in range(config['BASIC'].get('flvcheckercount', 1)):
+        FlvCheckThread()
+
+    # 读取未完成的时间戳校准
+    if os.path.isfile('./queue.pkl'):
+        with open('./queue.pkl', 'rb') as f:
+            unfinished = pickle.load(f)
+            for temppath, saveto in unfinished:
+                if os.path.isfile(temppath):
+                    logger.info(
+                        f'将之前未完成的时间戳校准加入队列：\n    {temppath} -> {saveto}')
+                    FlvCheckThread.addTask(temppath, saveto)
+
+    # 读取房间配置
     r = []
     for key in config.sections():
         if key == 'BASIC':
             continue
         item = config[key]
         if item.getboolean('activated', True):
-            r.append(LiveRoom(item.getint('roomid'), item.get(
-                'savefolder', key), item.getint('updateinterval', 120)))
+            r.append(LiveRoom(item.getint('roomid'), key, item.get(
+                'savefolder', key), item.getint('updateinterval', 120))
+            )
     return r
 
 
-def setlogger(logpath='warnings.log',level=logging.WARNING):
+def setlogger(logpath='warnings.log', level=logging.WARNING):
     global logger
     with open(logpath, 'a') as f:
         f.write('\n\n\n')
@@ -286,7 +390,8 @@ def setlogger(logpath='warnings.log',level=logging.WARNING):
 
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    setlogger()
+    setlogger('info.log', logging.INFO)
+    # setlogger()
     r = readconfig('config.ini')
     if not r:
         logger.warning('NO activated room found in config.ini')
@@ -296,5 +401,3 @@ if __name__ == "__main__":
     for sig in [signal.SIGINT, signal.SIGHUP, signal.SIGTERM]:
         signal.signal(sig, monitor.shutdown)
     monitor.run()
-    monitor.shutdown(None, None)
-    

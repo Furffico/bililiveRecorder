@@ -9,6 +9,7 @@ class Flv(object):
         self.path = path
         self.debug = debug
         self.output = output
+        self.keepRunning=True
      
      
      
@@ -40,7 +41,7 @@ class Flv(object):
         
         isFirstScriptTag = True
         remain = 10
-        while True:# and remain >0:
+        while self.keepRunning:# and remain >0:
             remain -=1
             # 读取前一个tag size
             data = origin.read(4)
@@ -160,10 +161,3 @@ class Flv(object):
             else:
                 if self.debug:
                     print("没有找到duration标签")
-        
-        
-if __name__ == '__main__':
-    flv = Flv(r"D:\Workspace\PythonWork\LiveRecorder\live\test-checked0.flv")
-    flv = Flv(r"test.flv")
-    flv.check()
-#     flv.changeDuration(flv.path, 123)
