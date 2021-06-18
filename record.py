@@ -5,7 +5,7 @@ import signal
 import threading
 import time
 from configparser import ConfigParser
-from datetime import datetime
+import datetime
 from queue import Queue
 import pickle
 
@@ -41,7 +41,7 @@ class LiveRoom():
             'Referer': 'https://live.bilibili.com/blanc/{}'.format(self.id),
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0'
         }
-        self._lastUpdate = datetime(2000, 1, 1, 10, 0, 0)
+        self._lastUpdate = datetime.datetime(2000, 1, 1, 10, 0, 0)
         self._savefolder = savefolder or 'common'
         self._baseUpdateInterval = updateInterval
         global OrgHistory
@@ -60,7 +60,7 @@ class LiveRoom():
             timeout=10, headers=self._headers
         ).json()
         self._username = response['data']['info']['uname']
-        logger.info(f'room{self.id} 获得直播间对应主播的用户名：{self._username}')
+        logger.info(f'room-{self.code} 获得直播间对应主播的用户名：{self._username}')
 
     def _updateStatus(self):
         # 获取房间基本信息及是否开播
@@ -74,12 +74,12 @@ class LiveRoom():
             for key in ['room_id', 'live_status', 'title', 'description', 'uid']
         }
         self.onair = self._roomInfo['live_status'] == 1
-        self._lastUpdate = datetime.now()
+        self._lastUpdate = datetime.datetime.now()
 
     def _getLiveUrl(self):
         # 获取推流链接
         if not self.onair:
-            logger.info(f'room{self.id} 当前没有在直播')
+            logger.info(f'room-{self.code} 当前没有在直播')
             return None
 
         # 推流码率
@@ -100,12 +100,12 @@ class LiveRoom():
         ).json()
         url = response['data']['durl'][0]['url']
         realqn = response['data']['current_qn']
-        logger.info("room%i: 申请清晰度 %s的链接，得到清晰度 %d的链接" % (self.id, qn, realqn))
+        logger.info(f"room-{self.code}: 申请清晰度{qn}的链接，得到清晰度{realqn}的链接")
         return url
 
     def startRecording(self):
         if not self.onair:
-            logger.info(f'room{self.id} 当前没有在直播')
+            logger.info(f'room-{self.code} 当前没有在直播')
             return None
         if not self._username:
             self._getUserName()
@@ -114,7 +114,7 @@ class LiveRoom():
         if not os.path.exists(savepath) or not os.path.isdir(savepath):
             os.mkdir(savepath)
         filename = '{room_id}-{username}-{time}-{endtime}-{title}'.format(
-            **self._roomInfo, username=self._username, time=datetime.now().strftime('%y%m%d%H%M%S'), endtime='{endtime}',)
+            **self._roomInfo, username=self._username, time=datetime.datetime.now().strftime('%y%m%d%H%M%S'), endtime='{endtime}',)
         # 防止标题和用户名中含有windows路径的非法字符
         filename = re.sub(r'[\<\>\:\"\\\'\\\/\|\?\*\.]', '', filename)+'.flv'
         self.recordThread = Recorder(
@@ -124,31 +124,37 @@ class LiveRoom():
     def report(self):
         if self.recordThread:
             if self.recordThread.isRecording():
-                delta = datetime.now()-self._lastUpdate
+                delta = datetime.datetime.now()-self._lastUpdate
                 if delta.seconds > 60 or delta.days > 0:
-                    logger.info('room{}: {} downloaded.'.format(
-                        self.id, dataunitConv(self.recordThread.downloaded)))
-                    self._lastUpdate = datetime.now()
+                    logger.info('room-{}: {} downloaded.'.format(
+                        self.code, dataunitConv(self.recordThread.downloaded)))
+                    self._lastUpdate = datetime.datetime.now()
             else:
-                self.recordThread = None  # 如果录制已停止则不再监控recorder
+                del self.recordThread
+                self.recordThread=None
         else:
-            delta = datetime.now()-self._lastUpdate
-            if delta.seconds > self.updateInterval or delta.days > 0:
-                logger.info(f'room{self.id}: updating status.')
-                self._lastUpdate = datetime.now()
-                self._updateStatus()
-                logger.info(f'room{self.id}: status updated.')
-                if self.onair:
-                    logger.info(f'room{self.id}: start recording.')
-                    self.startRecording()
+            delta = datetime.datetime.now()-self._lastUpdate
+            interval=self.updateInterval
+            if delta.seconds > interval or delta.days > 0:
+                logger.info(f'room-{self.code}: updating status with interval {interval:.3f}s.')
+                try:
+                    self._updateStatus()
+                except requests.exceptions.ReadTimeout:
+                    logger.error(f'room-{self.code}: Read timed out, retry after 60s.')
+                    self._lastUpdate += datetime.timedelta(seconds=60)
+                else:
+                    self._lastUpdate = datetime.datetime.now()
+                    logger.info(f'room-{self.code}: status updated.')
+                    if self.onair:
+                        logger.info(f'room-{self.code}: start recording.')
+                        self.startRecording()
 
     @property
     def updateInterval(self):
         if config['BASIC'].getboolean('overrideschedule', False):
             return self._baseUpdateInterval
         t = dividePeriod(time.time())
-        interval = 600*(self._baseUpdateInterval /
-                        600)**(self.history[t]/max(1, *self.history))
+        interval = 300*(self._baseUpdateInterval / 300)**(self.history[t]/max(1, *self.history))
         # print(interval)
         return interval
 
@@ -202,14 +208,14 @@ class Recorder(threading.Thread):
         self.code = code
 
     def run(self):
-        logger.info(f'recorder{self.roomid}: start running recording thread')
+        logger.info(f'recorder-{self.code}: start running recording thread')
         Recorder.runningThreads[(self.roomid, self._filename)] = self
         try:
             self._record()
         except Exception as e:
-            logger.exception(f'recorder{self.roomid}: exception occurred')
+            logger.exception(f'recorder-{self.code}: exception occurred')
         del Recorder.runningThreads[(self.roomid, self._filename)]
-        logger.info(f'recorder{self.roomid}: recording thread terminated')
+        logger.info(f'recorder-{self.code}: recording thread terminated')
 
     @classmethod
     def onexit(cls):
@@ -223,7 +229,7 @@ class Recorder(threading.Thread):
         self._downloading = True
 
         temppath = os.path.join(config['BASIC']['temppath'], self._filename)
-        starttime = datetime.now()
+        starttime = datetime.datetime.now()
         with open(temppath, "wb") as file:
             response = requests.get(
                 self._url, stream=True,
@@ -235,38 +241,42 @@ class Recorder(threading.Thread):
                     'Referer': 'https://live.bilibili.com/{}'.format(self.roomid),
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0',
                 },
-                timeout=120)
+                timeout=300)
             try:
-                for data in response.iter_content(chunk_size=1024*1024):
+                for data in response.iter_content(chunk_size=1048576):
                     if not self._downloading:
                         break
                     if data:
                         file.write(data)
                         self.downloaded += len(data)
             except Exception as e:
-                logger.exception(f'recorder{self.roomid}: exception occurred')
+                logger.exception(f'recorder-{self.code}: exception occurred')
             finally:
-                logger.info(f'recorder{self.roomid}: 停止录制')
+                logger.info(f'recorder-{self.code}: 停止录制')
                 response.close()
                 self._downloading = False
+            
+            if self.downloaded<131072: # 128KB
+                os.remove(temppath)
+                # 删除过小的文件
+            else:
+                st = dividePeriod(starttime.timestamp())
+                end = dividePeriod(time.time())
+                if st > end:
+                    end += 144
+                for i in range(st, end):
+                    OrgHistory[self.code][i % 144] += 1
 
-            st = dividePeriod(starttime.timestamp())
-            end = dividePeriod(time.time())
-            if st > end:
-                end += 144
-            for i in range(st, end+1):
-                OrgHistory[self.code][i % 144] += 1
-
-            saveto = os.path.join(self._savedir, self._filename.format(
-                endtime=datetime.now().strftime('%H%M%S')))
-            logger.info(f'recorder{self.roomid}: 添加任务至时间戳校准队列')
-            FlvCheckThread.addTask(temppath, saveto)
+                saveto = os.path.join(self._savedir, self._filename.format(
+                    endtime=datetime.datetime.now().strftime('%H%M%S')))
+                logger.info(f'recorder-{self.code}: 添加任务至时间戳校准队列')
+                FlvCheckThread.addTask(temppath, saveto)
 
     def isRecording(self):
         return self._downloading
 
     def stopRecording(self):
-        logger.info(f'recorder{self.roomid}: Exiting...')
+        logger.info(f'recorder-{self.code}: Exiting...')
         self._downloading = False
 
 
@@ -284,7 +294,10 @@ class FlvCheckThread(threading.Thread):
         if self.blocked:
             return
         logger.info(f'时间戳校准进程已启动')
-        while not self.blocked and not self.q.empty():
+        while not self.blocked:
+            if self.q.empty():
+                time.sleep(1)
+                continue
             temppath, saveto = self.q.get()
             self.flv = Flv(temppath, saveto)
             try:
@@ -303,11 +316,6 @@ class FlvCheckThread(threading.Thread):
     @classmethod
     def addTask(cls, temppath, saveto):
         cls.q.put((temppath, saveto))
-        if not cls.blocked:
-            for th in cls.threads:
-                if not th.is_alive():
-                    th.start()
-                    break
 
     @classmethod
     def onexit(cls):
@@ -344,7 +352,8 @@ def readconfig(path='config.ini'):
 
     # 创建时间戳校准进程
     for _ in range(config['BASIC'].get('flvcheckercount', 1)):
-        FlvCheckThread()
+        a=FlvCheckThread()
+        a.start()
 
     # 读取未完成的时间戳校准
     if os.path.isfile('./queue.pkl'):
