@@ -14,44 +14,35 @@ import requests
 from flv_checker import Flv
 
 
-def dataunitConv(size):  # size in bytes
-    if not size:
-        return '0'
-    n = size
-    magnitude = -1
-    units = ['bytes', 'KB', 'MB', 'GB', 'TB']
-    while n:
-        n >>= 10
-        magnitude += 1
-    if magnitude:
-        return '{n:.2f} {unit}'.format(n=size/(1 << magnitude*10), unit=units[magnitude])
-    else:
-        return f'{size} bytes'
-
-
 class LiveRoom():
     def __init__(self, roomid, code, savefolder=None, updateInterval=60):
+        global OrgHistory
+
         self.id = roomid
+        self._roomInfo = {}
+        self._username = None
+        self.code = code
         self.onair = False
+
         self.recordThread = None
-        self._headers = {
+        self._lastUpdate = datetime.datetime(2000, 1, 1, 10, 0, 0)
+        self._baseUpdateInterval = updateInterval
+        self._savefolder = savefolder or 'common'
+
+        if code not in OrgHistory:
+            OrgHistory[code] = [0]*144
+        self.history = OrgHistory[code]
+        
+    @property
+    def _headers(self):
+        return {
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
             'Origin': 'https://live.bilibili.com',
             'Referer': 'https://live.bilibili.com/blanc/{}'.format(self.id),
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0'
         }
-        self._lastUpdate = datetime.datetime(2000, 1, 1, 10, 0, 0)
-        self._savefolder = savefolder or 'common'
-        self._baseUpdateInterval = updateInterval
-        global OrgHistory
-        if code not in OrgHistory:
-            OrgHistory[code] = [0]*144
-        self.history = OrgHistory[code]
-        self._roomInfo = {}
-        self.code = code
-        self._username = None
-
+        
     def _getUserName(self):
         # 获取用户名
         response = requests.get(
@@ -60,7 +51,7 @@ class LiveRoom():
             timeout=10, headers=self._headers
         ).json()
         self._username = response['data']['info']['uname']
-        logger.info(f'room-{self.code} 获得直播间对应主播的用户名：{self._username}')
+        logger.info(f'room-{self.code}: Retrieved username {self._username}')
 
     def _updateStatus(self):
         # 获取房间基本信息及是否开播
@@ -79,7 +70,7 @@ class LiveRoom():
     def _getLiveUrl(self):
         # 获取推流链接
         if not self.onair:
-            logger.info(f'room-{self.code} 当前没有在直播')
+            logger.info(f'room-{self.code} is not on air.')
             return None
 
         # 推流码率
@@ -100,12 +91,11 @@ class LiveRoom():
         ).json()
         url = response['data']['durl'][0]['url']
         realqn = response['data']['current_qn']
-        logger.info(f"room-{self.code}: 申请清晰度{qn}的链接，得到清晰度{realqn}的链接")
         return url
 
     def startRecording(self):
         if not self.onair:
-            logger.info(f'room-{self.code} 当前没有在直播')
+            logger.info(f'room-{self.code} is not on air.')
             return None
         if not self._username:
             self._getUserName()
@@ -131,16 +121,18 @@ class LiveRoom():
                     self._lastUpdate = datetime.datetime.now()
             else:
                 del self.recordThread
-                self.recordThread=None
+                self.recordThread = None
         else:
             delta = datetime.datetime.now()-self._lastUpdate
-            interval=self.updateInterval
+            interval = self.updateInterval
             if delta.seconds > interval or delta.days > 0:
-                logger.info(f'room-{self.code}: updating status with interval {interval:.3f}s.')
+                logger.info(
+                    f'room-{self.code}: updating status with interval {interval:.3f}s.')
                 try:
                     self._updateStatus()
-                except requests.exceptions.ReadTimeout:
-                    logger.error(f'room-{self.code}: Read timed out, retry after 60s.')
+                except requests.exceptions:
+                    logger.error(
+                        f'room-{self.code}: Requests\' exception encountered, retry after 60s.')
                     self._lastUpdate += datetime.timedelta(seconds=60)
                 else:
                     self._lastUpdate = datetime.datetime.now()
@@ -151,47 +143,9 @@ class LiveRoom():
 
     @property
     def updateInterval(self):
-        if config['BASIC'].getboolean('overrideschedule', False):
-            return self._baseUpdateInterval
         t = dividePeriod(time.time())
-        interval = 300*(self._baseUpdateInterval / 300)**(self.history[t]/max(1, *self.history))
-        # print(interval)
-        return interval
-
-
-class Monitor:
-    def __init__(self, rooms):
-        self.rooms = rooms
-        self.running = True
-
-    def run(self):
-        logger.info('monitor thread running')
-        stopped = []
-        while self.running:
-            for room in self.rooms:
-                try:
-                    room.report()
-                except Exception as e:
-                    logger.exception(f'room{room.id}: exception occurred')
-            time.sleep(0.1)
-        logger.info('monitor thread stopped')
-
-    def shutdown(self, signalnum, frame):
-        self.running = False
-        logger.info('Program terminating')
-        FlvCheckThread.onexit()
-        Recorder.onexit()
-
-        logger.info('Storing history')
-        global OrgHistory
-        with open(config['BASIC']['history'], 'wb') as f:
-            pickle.dump(OrgHistory, f)
-        l = list(FlvCheckThread.getQueue())
-        logger.info('未完成的时间戳调整任务：\n' +
-                    '\n'.join((f"    {i} -> {j}" for i, j in l)))
-        with open('./queue.pkl', 'wb') as f:
-            pickle.dump(l, f)
-        logger.info('Program terminated')
+        return 300*(self._baseUpdateInterval /
+                300)**(self.history[t]/max(1, *self.history))
 
 
 class Recorder(threading.Thread):
@@ -200,15 +154,17 @@ class Recorder(threading.Thread):
     def __init__(self, roomid, roomInfo, url, filename, savedir, code):
         super().__init__()
         self.roomid = roomid
-        self.downloaded = 0
         self._url = url
+        self.code = code
         self._filename = filename
         self._savedir = savedir
+
         self._downloading = False
-        self.code = code
+        self.downloaded = 0
+        
 
     def run(self):
-        logger.info(f'recorder-{self.code}: start running recording thread')
+        logger.info(f'recorder-{self.code}: start recording thread')
         Recorder.runningThreads[(self.roomid, self._filename)] = self
         try:
             self._record()
@@ -238,7 +194,7 @@ class Recorder(threading.Thread):
                     'Accept-Encoding': 'gzip, deflate, br',
                     'Accept-Language': 'zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2',
                     'Origin': 'https://live.bilibili.com',
-                    'Referer': 'https://live.bilibili.com/{}'.format(self.roomid),
+                    'Referer': f'https://live.bilibili.com/{self.roomid}',
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0',
                 },
                 timeout=300)
@@ -252,25 +208,25 @@ class Recorder(threading.Thread):
             except Exception as e:
                 logger.exception(f'recorder-{self.code}: exception occurred')
             finally:
-                logger.info(f'recorder-{self.code}: 停止录制')
+                logger.info(f'recorder-{self.code}: stop recording')
                 response.close()
                 self._downloading = False
-            
-            if self.downloaded<131072: # 128KB
-                os.remove(temppath)
-                # 删除过小的文件
-            else:
-                st = dividePeriod(starttime.timestamp())
-                end = dividePeriod(time.time())
-                if st > end:
-                    end += 144
-                for i in range(st, end):
-                    OrgHistory[self.code][i % 144] += 1
 
-                saveto = os.path.join(self._savedir, self._filename.format(
-                    endtime=datetime.datetime.now().strftime('%H%M%S')))
-                logger.info(f'recorder-{self.code}: 添加任务至时间戳校准队列')
-                FlvCheckThread.addTask(temppath, saveto)
+        if self.downloaded < 65536:  # 64KB
+            os.remove(temppath) # 删除过小的文件
+        else:
+            # note live history
+            st = dividePeriod(starttime.timestamp())
+            end = dividePeriod(time.time())
+            if st > end:
+                end += 144
+            for i in range(st, end):
+                OrgHistory[self.code][i % 144] += 1
+
+            saveto = os.path.join(self._savedir, self._filename.format(
+                endtime=datetime.datetime.now().strftime('%H%M%S')))
+            logger.info(f'recorder-{self.code}: enqueue FlvCheck task.')
+            FlvCheckThread.addTask(temppath, saveto)
 
     def isRecording(self):
         return self._downloading
@@ -293,7 +249,7 @@ class FlvCheckThread(threading.Thread):
     def run(self):
         if self.blocked:
             return
-        logger.info(f'时间戳校准进程已启动')
+        logger.info(f'FlvCheckThread started.')
         while not self.blocked:
             if self.q.empty():
                 time.sleep(1)
@@ -311,7 +267,7 @@ class FlvCheckThread(threading.Thread):
                 else:
                     os.remove(saveto)
                     self.q.put((temppath, saveto))
-        logger.info(f'时间戳校准进程结束')
+        logger.info(f'FlvCheckThread terminated.')
 
     @classmethod
     def addTask(cls, temppath, saveto):
@@ -332,9 +288,57 @@ class FlvCheckThread(threading.Thread):
         while not cls.q.empty():
             yield cls.q.get()
 
+class Monitor:
+    def __init__(self, rooms):
+        self.rooms = rooms
+        self.running = True
 
-def dividePeriod(dt):
+    def run(self):
+        logger.info('monitor thread running')
+        stopped = []
+        while self.running:
+            for room in self.rooms:
+                try:
+                    room.report()
+                except Exception as e:
+                    logger.exception(f'room{room.id}: exception occurred')
+            time.sleep(0.1)
+        logger.info('monitor thread stopped')
+
+    def shutdown(self, signalnum, frame):
+        self.running = False
+        logger.info('Program terminating')
+        FlvCheckThread.onexit()
+        Recorder.onexit()
+
+        logger.info('Storing history')
+        global OrgHistory
+        with open(config['BASIC']['history'], 'wb') as f:
+            pickle.dump(OrgHistory, f)
+        l = list(FlvCheckThread.getQueue())
+        if l:
+            logger.info('Remaining FlvCheck tasks:\n' +
+                        '\n'.join((f"    {i} -> {j}" for i, j in l)))
+        with open('./queue.pkl', 'wb') as f:
+            pickle.dump(l, f)
+        logger.info('Program terminated')
+
+
+#! supporting functions ========================
+
+def dividePeriod(dt): # 将timestamp转换为时段的编号
     return int(dt) % 86400//600
+
+def dataunitConv(size: int):  # size in bytes
+    if not size:
+        return '0'
+    n = int(size)
+    magnitude = -1
+    units = ['bytes', 'KB', 'MB', 'GB', 'TB']
+    while n:
+        n >>= 10
+        magnitude += 1
+    return '{:.2f} {}'.format(size/(1 << magnitude*10), units[magnitude])
 
 
 def readconfig(path='config.ini'):
@@ -343,7 +347,7 @@ def readconfig(path='config.ini'):
     config.read(path)
 
     # 读取开播历史
-    hispath = config['BASIC'].get('history', None)
+    hispath = config['BASIC'].get('history', './history.pkl')
     if hispath and os.path.isfile(hispath):
         with open(hispath, 'rb') as f:
             OrgHistory = pickle.load(f)
@@ -352,18 +356,18 @@ def readconfig(path='config.ini'):
 
     # 创建时间戳校准进程
     for _ in range(config['BASIC'].get('flvcheckercount', 1)):
-        a=FlvCheckThread()
+        a = FlvCheckThread()
         a.start()
 
     # 读取未完成的时间戳校准
     if os.path.isfile('./queue.pkl'):
         with open('./queue.pkl', 'rb') as f:
             unfinished = pickle.load(f)
-            for temppath, saveto in unfinished:
-                if os.path.isfile(temppath):
-                    logger.info(
-                        f'将之前未完成的时间戳校准加入队列：\n    {temppath} -> {saveto}')
-                    FlvCheckThread.addTask(temppath, saveto)
+        for temppath, saveto in unfinished:
+            if os.path.isfile(temppath):
+                logger.info(
+                    f'Enqueue unfinished FlvCheck task:\n    {temppath} -> {saveto}')
+                FlvCheckThread.addTask(temppath, saveto)
 
     # 读取房间配置
     r = []
@@ -403,7 +407,7 @@ if __name__ == "__main__":
     # setlogger()
     r = readconfig('config.ini')
     if not r:
-        logger.warning('NO activated room found in config.ini')
+        logger.warning('NO activated room found in config.ini, program terminated')
         quit()
 
     monitor = Monitor(r)
