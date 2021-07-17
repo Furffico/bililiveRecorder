@@ -100,7 +100,7 @@ class LiveRoom():
         if not self._username:
             self._getUserName()
         url = self._getLiveUrl()
-        savepath = os.path.join(config['BASIC']['saveroot'], self._savefolder)
+        savepath = os.path.join(SAVEDIR, self._savefolder)
         if not os.path.exists(savepath) or not os.path.isdir(savepath):
             os.mkdir(savepath)
         filename = '{room_id}-{username}-{time}-{endtime}-{title}'.format(
@@ -184,7 +184,7 @@ class Recorder(threading.Thread):
     def _record(self):
         self._downloading = True
 
-        temppath = os.path.join(config['BASIC']['temppath'], self._filename)
+        temppath = os.path.join(TEMPDIR, self._filename)
         starttime = datetime.datetime.now()
         with open(temppath, "wb") as file:
             response = requests.get(
@@ -313,13 +313,13 @@ class Monitor:
 
         logger.info('Storing history')
         global OrgHistory
-        with open(config['BASIC']['history'], 'wb') as f:
+        with open(os.path.join(HISTORYPATH,'history.pkl'), 'wb') as f:
             pickle.dump(OrgHistory, f)
         l = list(FlvCheckThread.getQueue())
         if l:
             logger.info('Remaining FlvCheck tasks:\n' +
                         '\n'.join((f"    {i} -> {j}" for i, j in l)))
-        with open('./queue.pkl', 'wb') as f:
+        with open(os.path.join(HISTORYPATH,'queue.pkl'), 'wb') as f:
             pickle.dump(l, f)
         logger.info('Program terminated')
 
@@ -342,12 +342,22 @@ def dataunitConv(size: int):  # size in bytes
 
 
 def readconfig(path='config.ini'):
-    global config, OrgHistory
+    global config, OrgHistory,TEMPDIR,SAVEDIR,HISTORYPATH
     config = ConfigParser()
     config.read(path)
 
+    HISTORYPATH=os.getenv('RECORDER_HISTORYDIR') or config['BASIC'].get('history', './')
+    TEMPDIR=os.getenv('RECORDER_TEMPDIR') or config['BASIC']['temppath']
+    SAVEDIR=os.getenv('RECORDER_SAVEDIR') or config['BASIC']['saveroot']
+    if not os.path.isdir(HISTORYPATH):
+        os.mkdir(HISTORYPATH)
+    if not os.path.isdir(TEMPDIR):
+        os.mkdir(TEMPDIR)
+    if not os.path.isdir(SAVEDIR):
+        os.mkdir(SAVEDIR)
+
     # 读取开播历史
-    hispath = config['BASIC'].get('history', './history.pkl')
+    hispath = os.path.join(HISTORYPATH,'history.pkl')
     if hispath and os.path.isfile(hispath):
         with open(hispath, 'rb') as f:
             OrgHistory = pickle.load(f)
@@ -360,8 +370,9 @@ def readconfig(path='config.ini'):
         a.start()
 
     # 读取未完成的时间戳校准
-    if os.path.isfile('./queue.pkl'):
-        with open('./queue.pkl', 'rb') as f:
+    queuepath=os.path.join(HISTORYPATH,'queue.pkl')
+    if os.path.isfile(queuepath):
+        with open(queuepath, 'rb') as f:
             unfinished = pickle.load(f)
         for temppath, saveto in unfinished:
             if os.path.isfile(temppath):
@@ -382,29 +393,32 @@ def readconfig(path='config.ini'):
     return r
 
 
-def setlogger(logpath='warnings.log', level=logging.WARNING):
+def setlogger(level=logging.INFO,filepath=None,filelevel=logging.WARNING):
     global logger
-    with open(logpath, 'a') as f:
-        f.write('\n\n\n')
     logger = logging.getLogger('recorder')
     logger.setLevel(level)
-    handler1 = logging.StreamHandler()
-    handler2 = logging.FileHandler(filename=logpath)
     formatter = logging.Formatter(
         "[%(asctime)s][%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    handler1 = logging.StreamHandler()
     handler1.setFormatter(formatter)
-    handler2.setFormatter(formatter)
     handler1.setLevel(level)
-    handler2.setLevel(level)
     logger.addHandler(handler1)
-    logger.addHandler(handler2)
+
+    if filepath:
+        with open(filepath, 'a') as f:
+            f.write('\n\n\n')
+        handler2 = logging.FileHandler(filename=filepath)
+        handler2.setFormatter(formatter)
+        handler2.setLevel(filelevel)
+        logger.addHandler(handler2)
+    
     logger.info('Program started')
 
 
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    setlogger('info.log', logging.INFO)
-    # setlogger()
+    setlogger(filepath='./warning.log')
     r = readconfig('config.ini')
     if not r:
         logger.warning('NO activated room found in config.ini, program terminated')
