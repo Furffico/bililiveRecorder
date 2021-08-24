@@ -29,10 +29,13 @@ $ git clone https://github.com/Furffico/bililiveRecorder.git
 $ docker build -t bililiverecorder:1.4 .
 ```
 
-按照说明配置好config.ini并拷贝至主机挂载至容器的目录内。运行镜像，其中/path/to/data替换为上述目录的路径：
+按照说明配置好config.ini并拷贝至主机挂载至容器的目录内。运行容器，其中`/path/to/data`替换为前述目录的路径：
 ``` bash
 $ docker run -d -v /path/to/data:/data bililiverecorder:1.4
 ```
+
+#### 说明
+容器的默认时区为Asia/Shanghai，如需更改时区请在构建前修改Dockerfile。
 
 ## To-dos
 - 让代码更美观

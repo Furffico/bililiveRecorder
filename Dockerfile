@@ -7,6 +7,11 @@ WORKDIR /app
 COPY ./recorder.py ./requirements.txt /app/
 COPY ./main /app/main
 
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apk/repositories && \
+    apk add -U tzdata && \
+    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    apk del tzdata
+
 RUN pip3 install --no-cache-dir -r requirements.txt && \
     rm requirements.txt
 
