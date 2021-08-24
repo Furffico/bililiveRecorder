@@ -5,30 +5,22 @@ import struct
 
 class Flv(object):
 
-    def __init__(self, path, output=None, debug = False):
+    def __init__(self, path, output, debug = False):
         self.path = path
         self.debug = debug
         self.output = output
         self.keepRunning=True
      
      
-     
     def check(self):
-        file_name = os.path.basename(os.path.realpath(self.path))
-        file_short_name, file_extension = os.path.splitext(file_name)
-        if self.output == None:
-            path_new = os.path.join(file_folder, file_short_name + '-checked0.flv')
-        else:
-            path_new = self.output
+        path_new = self.output
 
-        print(path_new)
-        with open(self.path,"rb") as origin:
-            with open(path_new,"wb+") as dest:
-                # 复制头部
-                data = origin.read(9)
-                dest.write(data)
-                # 处理Tag内容
-                self.checkTag(origin, dest)
+        with open(self.path,"rb") as origin,open(path_new,"wb+") as dest:
+            # 复制头部
+            data = origin.read(9)
+            dest.write(data)
+            # 处理Tag内容
+            self.checkTag(origin, dest)
         
         self.changeDuration(self.path, float(self.lastTimestampWrite[b'\x08']) / 1000)    
 

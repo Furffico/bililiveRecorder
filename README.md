@@ -21,12 +21,12 @@ $ python3 record.py
 
 随后用docker构建镜像：
 ``` bash
-$ docker build -t bilibiliRecorder:1.3 .
+$ docker build -t bililiverecorder:1.3 .
 ```
 
 运行镜像，其中/path/to/data替换为数据卷或主机上用于存储录播数据的位置：
 ``` bash
-$ docker run -d -v /path/to/data:/data bilibiliRecorder:1.3
+$ docker run -d -v /path/to/data:/data bililiverecorder:1.3
 ```
 
 ## To-dos
