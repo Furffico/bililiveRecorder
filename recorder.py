@@ -171,7 +171,27 @@ def run():
 
     if configpath:
         if not args.config and not os.path.isfile(os.getenv('CONFIGPATH')):
-            logger.warning('请将配置文件config.ini放置在挂载路径的根目录下。')
+            # 用docker运行时配置文件不在指定的位置
+            open(os.getenv('CONFIGPATH'),'w').write("""\
+[BASIC]
+; 使用docker运行时以下三项都不需要更改
+saveroot=/data/downloads
+temppath=/data/tmp
+history=/data
+
+; 房间配置（可以有不止一个） 
+; 例：
+[bilibiliLive] ; 房间的标识符
+; 直播间的id，必填
+roomid=1
+; 保存录播的路径（为全局配置中saveroot的子目录），默认为房间的标识符
+savefolder=哔哩哔哩直播
+; 请求直播状态的最少间隔（单位秒，默认为60）
+updateinterval=60
+; 是否(yes/no)启用监听和录播，默认为yes
+activated=yes
+            """)
+            logger.warning('请按照说明配置好挂载目录下的config.ini后再运行这个容器。')
             logger.info('program exited')
             quit()
         if args.cleartmp:
@@ -184,4 +204,5 @@ def run():
 
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    print("\n\n\n\n")
     run()

@@ -12,23 +12,27 @@ API和flv的时间轴处理的部分参考和复制了[nICEnnnnnnnLee/LiveRecord
 ### 直接运行
 将record.py和flv_checker.py放置于同一个文件夹内，安装依赖requests库并配置好config.ini。
 ```bash
-$ python3 record.py
+$ python3 record.py -c ./config.ini
+# 或者
+$ python3 record.py -r <roomid> -s <savedir>
 ```
 程序运行时会循环监听房间的开播状态或者录制直播。
 
 ### 通过docker运行
-首先将文件clone到本地，并按照说明配置config.ini。
+首先将文件clone到本地。
+```bash
+$ git clone https://github.com/Furffico/bililiveRecorder.git
+```
 
 随后用docker构建镜像：
 ``` bash
-$ docker build -t bililiverecorder:1.3 .
+$ docker build -t bililiverecorder:1.4 .
 ```
 
-运行镜像，其中/path/to/data替换为数据卷或主机上用于存储录播数据的位置：
+按照说明配置好config.ini并拷贝至主机挂载至容器的目录内。运行镜像，其中/path/to/data替换为上述目录的路径：
 ``` bash
-$ docker run -d -v /path/to/data:/data bililiverecorder:1.3
+$ docker run -d -v /path/to/data:/data bililiverecorder:1.4
 ```
 
 ## To-dos
-- 完善命令行参数和运行配置
 - 让代码更美观
