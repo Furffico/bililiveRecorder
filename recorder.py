@@ -3,9 +3,6 @@ import pickle
 import logging
 import signal
 
-from main.Liveroom import LiveRoom
-from main.Monitor import Monitor
-
 dockerconfig = """\
 [BASIC]
 ; 使用docker运行时以下三项都不需要更改
@@ -29,8 +26,7 @@ activated=yes
 """
 
 
-def readHistory(path):
-    # 读取开播历史
+def readHistory(path):    # 读取开播历史
     hispath = os.path.join(path, 'history.pkl') if path else None
     if hispath and os.path.isfile(hispath):
         with open(hispath, 'rb') as f:
@@ -67,12 +63,10 @@ def setlogger(level=logging.INFO, filepath=None, filelevel=logging.WARNING):
     logger.info('Program started')
 
 
-def cleartempDir(path):
-    # 完成剩余的时间轴处理任务后退出
+def cleartempDir(path):    # 完成剩余的时间轴处理任务后退出
     from configparser import ConfigParser
     from main.Monitor import createFlvcheckThreads
     from main.FlvCheckThread import FlvCheckThread
-    import pickle
 
     config = ConfigParser()
     config.read(path)
@@ -92,9 +86,11 @@ def cleartempDir(path):
         pickle.dump(l, f)
 
 
-def runfromConfig(path):
-    # 从设置文件读取房间
+def runfromConfig(path):    # 从设置文件读取房间后运行
     from configparser import ConfigParser
+    from main.Liveroom import LiveRoom
+    from main.Monitor import Monitor
+
     config = ConfigParser()
     config.read(path)
 
@@ -151,24 +147,18 @@ def runfromConfig(path):
     monitor.run()
 
 
-def runfromTerminalArgs(args):
-    # 从命令行参数读取房间
-    if not args.roomid:
-        logger.warning('roomid required')
-        quit()
-    if not args.savedir:
-        logger.warning('savedir required')
-        quit()
-    elif not os.path.isdir(args.savedir):
+def runfromTerminalArgs(args):    # 从命令行参数读取房间后运行
+    from main.Liveroom import LiveRoom
+    from main.Monitor import Monitor
+
+    if not os.path.isdir(args.savedir):
         logger.warning('provided savedir is not a folder')
         quit()
 
     SAVEDIR = args.savedir
-    HISTORYPATH = None
-    readHistory(HISTORYPATH)
 
-    r = [LiveRoom(args.roomid, 'M', SAVEDIR, args.updateinterval,
-                  overrideDynamicInterval=True)]
+    LiveRoom.overrideDynamicInterval=True
+    r = [LiveRoom(args.roomid, 'M', SAVEDIR, args.updateinterval)]
 
     # 运行
     monitor = Monitor(r, cleanTerminate=True)
@@ -180,15 +170,13 @@ def runfromTerminalArgs(args):
 def run():
     import argparse
     parser = argparse.ArgumentParser(description='A recorder for bililive.')
-    parser.add_argument("-c", "--config", type=str,
-                        help="path to config file.")
-    parser.add_argument("--log", type=str,
-                        help="path to log file.", default='')
+
+    parser.add_argument("-c", "--config", type=str, help="path to config file.")
+    parser.add_argument("--log", type=str, help="path to log file.", default='')
 
     parser.add_argument("-r", "--roomid", type=int)
     parser.add_argument("-i", "--updateinterval", type=int, default=30)
-    parser.add_argument("-s", "--savedir", type=str,
-                        help="directory to store recorded videos.")
+    parser.add_argument("-s", "--savedir", type=str, help="directory to store recorded videos.")
     parser.add_argument("--cleartmp", action="store_true", default=False)
 
     args = parser.parse_args()
@@ -209,10 +197,12 @@ def run():
         else:
             runfromConfig(configpath)
     else:
+        if not args.roomid or not args.savedir:
+            logger.warning('config file or parameter ROOMID and SAVEDIR is required.')
+            quit()
         runfromTerminalArgs(args)
 
 
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    print("\n\n\n\n")
     run()

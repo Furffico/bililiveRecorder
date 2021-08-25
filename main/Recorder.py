@@ -1,7 +1,7 @@
 import threading
 import requests
 import logging
-import datetime
+import time
 
 logger = logging.getLogger('recorder')
 
@@ -41,7 +41,7 @@ class Recorder(threading.Thread):
     def _record(self):
         self._downloading = True
 
-        starttime = datetime.datetime.now()
+        starttime = time.time()
         with open(self.savepath, "wb") as file:
             response = requests.get(
                 self._url, stream=True,
@@ -61,14 +61,15 @@ class Recorder(threading.Thread):
                     if data:
                         file.write(data)
                         self.downloaded += len(data)
-            except Exception as e:
-                logger.exception(f'{self.threadid}: exception occurred')
+            except:
+                logger.exception(f'{self.threadid}: exception occurred.',exc_info=True)
             finally:
+                endtime = time.time()
                 logger.info(f'{self.threadid}: stop recording')
                 response.close()
                 self._downloading = False
-        
-        self.room.recordingFinished(self.savepath,self.downloaded,starttime)
+                
+                self.room.recordingFinished(self.savepath,self.downloaded,starttime,endtime)
 
     def isRecording(self):
         return self._downloading

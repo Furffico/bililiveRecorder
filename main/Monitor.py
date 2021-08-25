@@ -2,6 +2,8 @@ import logging
 import time
 import os
 import pickle
+from queue import PriorityQueue
+import threading
 
 from .FlvCheckThread import FlvCheckThread
 from .Recorder import Recorder
@@ -30,27 +32,44 @@ def createFlvcheckThreads(count=1, historypath=None):
 
 class Monitor:
     def __init__(self, rooms, flvcheckercount=1, cleanTerminate=False, historypath=None):
+        if len(rooms) == 0:
+            raise Exception('list for Liverooms is empty')
         self.rooms = rooms
-        self.running = True
         createFlvcheckThreads(flvcheckercount, historypath)
         self.cleanTerminate = cleanTerminate
         self.historypath = historypath
+        self.event = threading.Event()
 
     def run(self):
         logger.info('monitor thread running')
-        while self.running:
-            for room in self.rooms:
-                try:
-                    room.report()
-                except Exception as e:
-                    logger.exception(
-                        f'room{room.id}: exception occurred while checking for status')
-                time.sleep(0.1)
-            time.sleep(0.5)
+        q = PriorityQueue()
+        t = time.time()+3
+        for index in range(len(self.rooms)):
+            q.put((t, index))
+        logger.info('The process will begin after 3 seconds')
+
+        while not self.event.is_set():
+            schedule, roomindex = q.get()
+            t = time.time()
+            if t < schedule:
+                self.event.wait(schedule-t)
+                if self.event.is_set():
+                    break
+            
+            room = self.rooms[roomindex]
+            try:
+                interval = room.report()
+            except Exception as e:
+                logger.exception(f'room{room.id}: exception occurred')
+                logger.info(f'room{room.id}: retry after 60 seconds.')
+                interval = 60
+            q.put((time.time()+interval, roomindex))
+            self.event.wait(0.1)
+
         logger.info('monitor thread stopped')
 
     def shutdown(self, signalnum, frame):
-        self.running = False
+        self.event.set()
         logger.info('Program terminating')
         Recorder.onexit()
         if self.cleanTerminate:
@@ -60,15 +79,15 @@ class Monitor:
 
         logger.info('Storing history')
         if self.historypath:
-            his=os.path.join(self.historypath, 'history.pkl')
+            his = os.path.join(self.historypath, 'history.pkl')
             if os.path.isfile(his):
                 with open(his, 'rb') as f:
-                    OrgHistory=pickle.load(f)
+                    OrgHistory = pickle.load(f)
             else:
-                OrgHistory={}
+                OrgHistory = {}
 
             for r in self.rooms:
-                OrgHistory[r.id]=r.history
+                OrgHistory[r.id] = r.history
             with open(his, 'wb') as f:
                 pickle.dump(OrgHistory, f)
             l = list(FlvCheckThread.getQueue())
@@ -77,5 +96,5 @@ class Monitor:
                             '\n'.join((f"    {i} -> {j}" for i, j in l)))
             with open(os.path.join(self.historypath, 'queue.pkl'), 'wb') as f:
                 pickle.dump(l, f)
-
+            
         logger.info('Program terminated')

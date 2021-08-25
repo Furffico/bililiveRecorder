@@ -1,4 +1,4 @@
-import datetime
+import time
 import requests
 import logging
 import os
@@ -9,19 +9,16 @@ from .FlvCheckThread import FlvCheckThread
 
 logger = logging.getLogger('monitor')
 
-startNotice="""\
+startNotice = """\
 直播间 {name}({id}) 录制开始。
+  🎈 直播标题：{title}"""
 
-    🎈 直播标题:{title}
-"""
-
-endNotice="""\
+endNotice = """\
 直播间 {name}({id}) 录制结束。
+  🎈 直播标题：{title}
+  💾 文件大小：{filesize}
+  ⏱ 录制时长：{duration}"""
 
-    🎈 直播标题: {title}
-    💾 文件大小: {filesize}
-    ⏱ 录制时长: {duration}
-"""
 
 def _dividePeriod(dt):  # 将timestamp转换为时段的编号
     return int(dt) % 86400//600
@@ -29,7 +26,7 @@ def _dividePeriod(dt):  # 将timestamp转换为时段的编号
 
 def _dataunitConv(size: int):  # size in bytes
     # 自动单位转换
-    if size<=0:
+    if size <= 0:
         return '0'
     n = int(size)
     magnitude = -1
@@ -39,19 +36,22 @@ def _dataunitConv(size: int):  # size in bytes
         magnitude += 1
     return '{:.3f} {}'.format(size/(1 << magnitude*10), units[magnitude])
 
-def _formatDuration(duration:float):
-    duration=int(duration)
-    seconds=duration%60
-    minutes=duration//60%60
-    hours=duration//3600
+
+def _formatDuration(duration: float):
+    duration = int(duration)
+    seconds = duration % 60
+    minutes = duration//60 % 60
+    hours = duration//3600
     return \
         f'{hours}hr {minutes:02d}min {seconds:02d}sec' if hours else \
         f'{minutes}min {seconds:02d}sec' if minutes else \
         f'{seconds}sec'
-    
+
 
 class LiveRoom():
-    def __init__(self, roomid, code, savefolder, updateInterval=60, history=None, tmpfolder=None, overrideDynamicInterval=False):
+    overrideDynamicInterval = False
+
+    def __init__(self, roomid, code, savefolder, updateInterval=60, history=None, tmpfolder=None):
 
         self.id = roomid
         self.code = code
@@ -59,19 +59,19 @@ class LiveRoom():
         self._tmpfolder = tmpfolder or savefolder
         self.history = history or [0]*144
         self._baseUpdateInterval = updateInterval
-        self._overrideDynamicInterval = overrideDynamicInterval
 
         self._roomInfo = {}
         self._username = None
         self.onair = False
         self.recordThread = None
-        self._lastUpdate = datetime.datetime(2000, 1, 1, 10, 0, 0)
 
-        self._headers = {
+    @property
+    def _headers(self):
+        return {
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
             'Origin': 'https://live.bilibili.com',
-            'Referer': 'https://live.bilibili.com/blanc/{}'.format(self.id),
+            'Referer': f'https://live.bilibili.com/blanc/{self.id}',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0'
         }
 
@@ -97,7 +97,6 @@ class LiveRoom():
             for key in ['room_id', 'live_status', 'title', 'description', 'uid']
         }
         self.onair = self._roomInfo['live_status'] == 1
-        self._lastUpdate = datetime.datetime.now()
 
     def _getLiveUrl(self):
         # 获取推流链接
@@ -134,9 +133,9 @@ class LiveRoom():
         if not os.path.isdir(self._tmpfolder):
             os.mkdir(self._tmpfolder)
         filename = '{room_id}-{username}-{time}-{endtime}-{title}'.format(
-            **self._roomInfo, 
-            username=self._username, 
-            time=datetime.datetime.now().strftime('%y%m%d%H%M%S'), 
+            **self._roomInfo,
+            username=self._username,
+            time=time.strftime('%y%m%d%H%M%S'),
             endtime='{endtime}'
         )
 
@@ -151,102 +150,113 @@ class LiveRoom():
         )
         self.recordThread.start()
 
-    def report(self):
+    def report(self) -> float:
+        # 返回值为现在距下一次检查的时间
         if self.recordThread:
             if self.recordThread.isRecording():
-                delta = datetime.datetime.now()-self._lastUpdate
-                if delta.seconds > 60 or delta.days > 0:
-                    logger.info('{}: {} downloaded.'.format(
-                        self.code, _dataunitConv(self.recordThread.downloaded)))
-                    self._lastUpdate = datetime.datetime.now()
+                logger.info('{}: {} downloaded.'.format(
+                    self.code, _dataunitConv(self.recordThread.downloaded)))
+                return 10  # report status after 10 sec
             else:
                 del self.recordThread
                 self.recordThread = None
+                return 5 # 防止因网络问题导致断流
         else:
-            delta = datetime.datetime.now()-self._lastUpdate
             interval = self.updateInterval
-            if delta.seconds > interval or delta.days > 0:
-                logger.info(
-                    f'{self.code}: updating status with interval {interval:.3f}s.')
-                try:
-                    self._updateStatus()
-                except requests.exceptions:
-                    logger.error(
-                        f'{self.code}: Requests\' exception encountered, retry after 60s.')
-                    self._lastUpdate += datetime.timedelta(seconds=60)
+            logger.info(
+                f'{self.code}: updating status with interval {interval:.3f}s.')
+            try:
+                self._updateStatus()
+            except requests.exceptions:
+                logger.error(
+                    f'{self.code}: Requests\' exception encountered, retry after 60s.')
+                return 60
+            else:
+                logger.info(f'{self.code}: status updated.')
+                if self.onair:
+                    logger.info(f'{self.code}: start recording.')
+                    self.startRecording()
+                    return 10
                 else:
-                    self._lastUpdate = datetime.datetime.now()
-                    logger.info(f'{self.code}: status updated.')
-                    if self.onair:
-                        logger.info(f'{self.code}: start recording.')
-                        self.startRecording()
+                    return interval
 
     @property
     def updateInterval(self):
-        if self._overrideDynamicInterval:
+        if self.overrideDynamicInterval:
             return self._baseUpdateInterval
         else:
-            t = _dividePeriod(datetime.datetime.now().timestamp())
-            return 300*(self._baseUpdateInterval / 300)**(self.history[t]/max(1, *self.history))
+            if sum(self.history) < 72:  # 历史数据太少
+                return self._baseUpdateInterval
+            else:
+                t = _dividePeriod(time.time())
+                return 300*(self._baseUpdateInterval / 300)**(self.history[t]/max(self.history))
 
-    def recordingFinished(self, path, datasize, sttime):
+    def recordingFinished(self, path, datasize, sttime, endtime):
         if datasize < 65536:  # 64KB
             os.remove(path)  # 删除过小的文件
         else:
-            endtime = datetime.datetime.now()
             # note live history
-            st = _dividePeriod(sttime.timestamp())
-            end = _dividePeriod(endtime.timestamp())
+            st = _dividePeriod(sttime)
+            end = _dividePeriod(endtime)
             if st > end:
                 end += 144
             for i in range(st, end):
                 self.history[i % 144] += 1
-            
+
             if not os.path.isdir(self._savefolder):
                 os.mkdir(self._savefolder)
-            filename = os.path.basename(path).format(endtime=endtime.strftime('%H%M%S'))
+            filename = os.path.basename(path).format(
+                endtime=time.strftime('%H%M%S', time.localtime(endtime)))
             temppath = os.path.join(self._tmpfolder, filename)
             saveto = os.path.join(self._savefolder, filename)
             if self._tmpfolder == self._savefolder:
-                temppath = temppath.rstrip(".flv")+".tmp.flv"
+                temppath = temppath[:-4]+".tmp.flv"
 
             os.rename(path, temppath)
 
-            self.notifyAtEnd(endtime.timestamp()-sttime.timestamp(),datasize)
+            self.notifyAtEnd(endtime-sttime, datasize)
 
             logger.info(f'{self.code}: enqueue FlvCheck task.')
             FlvCheckThread.addTask(temppath, saveto)
+            
 
-    def notifyAtBeginning(self,*args):
+    def notifyAtBeginning(self):
         pass
 
-    def notifyAtEnd(self,*args):
+    def notifyAtEnd(self, duration, filesize):
         pass
 
     @classmethod
-    def setNotice(cls,barkurl):
-        def pushMessage(title,msg):
-            requests.post(barkurl,data={
-                "title":title,
-                "body":msg,
-                "group":"recorder"
-            })
-        
+    def setNotification(cls, barkurl):
+        def pushMessage(title, msg):
+            logger.info(
+                f"sending message to {barkurl}:\n title:{title} \n{msg}")
+            try:
+                req = requests.post(barkurl, data={
+                    "title": title,
+                    "body": msg,
+                    "group": "recorder"
+                })
+            except:
+                logger.warning("error occurred when sending message.")
+            else:
+                logger.info(f"received data: {req.text}")
+
         def notifyAtBeginning(self):
-            pushMessage("录播姬",startNotice.format(
+            pushMessage("录播姬", startNotice.format(
                 name=self._username or self.code,
                 id=self.id,
                 title=self._roomInfo['title']
             ))
-        
-        def notifyAtEnd(self,duration,filesize):
-            pushMessage("录播姬",endNotice.format(
+
+        def notifyAtEnd(self, duration, filesize):
+            pushMessage("录播姬", endNotice.format(
                 name=self._username or self.code,
                 id=self.id,
                 title=self._roomInfo["title"],
                 filesize=_dataunitConv(filesize),
                 duration=_formatDuration(duration)
             ))
-        
-        cls.notifyAtBeginning=notifyAtBeginning
-        cls.notifyAtEnd=notifyAtEnd
+
+        cls.notifyAtBeginning = notifyAtBeginning
+        cls.notifyAtEnd = notifyAtEnd

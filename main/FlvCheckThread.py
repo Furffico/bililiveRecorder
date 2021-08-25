@@ -11,7 +11,7 @@ logger = logging.getLogger('postprocess')
 class FlvCheckThread(threading.Thread):
     q = Queue()
     threads = []
-    blocked = False
+    event=threading.Event()
 
     def __init__(self):
         super().__init__()
@@ -19,12 +19,10 @@ class FlvCheckThread(threading.Thread):
         self.flv = None
 
     def run(self):
-        if self.blocked:
-            return
         logger.info(f'FlvCheckThread started.')
-        while not self.blocked:
+        while not self.event.is_set():
             if self.q.empty():
-                time.sleep(1)
+                self.event.wait(1)
                 continue
             temppath, saveto = self.q.get()
             self.flv = Flv(temppath, saveto)
@@ -40,6 +38,7 @@ class FlvCheckThread(threading.Thread):
                 else:
                     os.remove(saveto)
                     self.q.put((temppath, saveto))
+            self.flv=None
         logger.info(f'FlvCheckThread terminated.')
 
     @classmethod
@@ -48,7 +47,7 @@ class FlvCheckThread(threading.Thread):
 
     @classmethod
     def onexit(cls):
-        cls.blocked = True
+        cls.event.set()
         for th in cls.threads:
             if th.flv:
                 th.flv.keepRunning = False
