@@ -9,6 +9,19 @@ from .FlvCheckThread import FlvCheckThread
 
 logger = logging.getLogger('monitor')
 
+startNotice="""\
+直播间 {name}({id}) 录制开始。
+
+    🎈 直播标题:{title}
+"""
+
+endNotice="""\
+直播间 {name}({id}) 录制结束。
+
+    🎈 直播标题: {title}
+    💾 文件大小: {filesize}
+    ⏱ 录制时长: {duration}
+"""
 
 def _dividePeriod(dt):  # 将timestamp转换为时段的编号
     return int(dt) % 86400//600
@@ -16,7 +29,7 @@ def _dividePeriod(dt):  # 将timestamp转换为时段的编号
 
 def _dataunitConv(size: int):  # size in bytes
     # 自动单位转换
-    if not size:
+    if size<=0:
         return '0'
     n = int(size)
     magnitude = -1
@@ -24,8 +37,18 @@ def _dataunitConv(size: int):  # size in bytes
     while n:
         n >>= 10
         magnitude += 1
-    return '{:.2f} {}'.format(size/(1 << magnitude*10), units[magnitude])
+    return '{:.3f} {}'.format(size/(1 << magnitude*10), units[magnitude])
 
+def _formatDuration(duration:float):
+    duration=int(duration)
+    seconds=duration%60
+    minutes=duration//60%60
+    hours=duration//3600
+    return \
+        f'{hours}hr {minutes:02d}min {seconds:02d}sec' if hours else \
+        f'{minutes}min {seconds:02d}sec' if minutes else \
+        f'{seconds}sec'
+    
 
 class LiveRoom():
     def __init__(self, roomid, code, savefolder, updateInterval=60, history=None, tmpfolder=None, overrideDynamicInterval=False):
@@ -110,14 +133,16 @@ class LiveRoom():
         url = self._getLiveUrl()
         if not os.path.isdir(self._tmpfolder):
             os.mkdir(self._tmpfolder)
-        if not os.path.isdir(self._savefolder):
-            os.mkdir(self._savefolder)
         filename = '{room_id}-{username}-{time}-{endtime}-{title}'.format(
-            **self._roomInfo, username=self._username, time=datetime.datetime.now().strftime('%y%m%d%H%M%S'), endtime='{endtime}',)
+            **self._roomInfo, 
+            username=self._username, 
+            time=datetime.datetime.now().strftime('%y%m%d%H%M%S'), 
+            endtime='{endtime}'
+        )
 
         # 防止标题和用户名中含有windows路径的非法字符
         filename = re.sub(r'[\<\>\:\"\\\'\\\/\|\?\*\.]', '', filename)+'.flv'
-
+        self.notifyAtBeginning()
         self.recordThread = Recorder(
             url=url,
             savepath=os.path.join(self._tmpfolder, filename),
@@ -176,9 +201,10 @@ class LiveRoom():
                 end += 144
             for i in range(st, end):
                 self.history[i % 144] += 1
-
-            filename = os.path.basename(path).format(
-                endtime=endtime.strftime('%H%M%S'))
+            
+            if not os.path.isdir(self._savefolder):
+                os.mkdir(self._savefolder)
+            filename = os.path.basename(path).format(endtime=endtime.strftime('%H%M%S'))
             temppath = os.path.join(self._tmpfolder, filename)
             saveto = os.path.join(self._savefolder, filename)
             if self._tmpfolder == self._savefolder:
@@ -186,5 +212,41 @@ class LiveRoom():
 
             os.rename(path, temppath)
 
+            self.notifyAtEnd(endtime.timestamp()-sttime.timestamp(),datasize)
+
             logger.info(f'{self.code}: enqueue FlvCheck task.')
             FlvCheckThread.addTask(temppath, saveto)
+
+    def notifyAtBeginning(self,*args):
+        pass
+
+    def notifyAtEnd(self,*args):
+        pass
+
+    @classmethod
+    def setNotice(cls,barkurl):
+        def pushMessage(title,msg):
+            requests.post(barkurl,data={
+                "title":title,
+                "body":msg,
+                "group":"recorder"
+            })
+        
+        def notifyAtBeginning(self):
+            pushMessage("录播姬",startNotice.format(
+                name=self._username or self.code,
+                id=self.id,
+                title=self._roomInfo['title']
+            ))
+        
+        def notifyAtEnd(self,duration,filesize):
+            pushMessage("录播姬",endNotice.format(
+                name=self._username or self.code,
+                id=self.id,
+                title=self._roomInfo["title"],
+                filesize=_dataunitConv(filesize),
+                duration=_formatDuration(duration)
+            ))
+        
+        cls.notifyAtBeginning=notifyAtBeginning
+        cls.notifyAtEnd=notifyAtEnd

@@ -45,7 +45,8 @@ class Monitor:
                 except Exception as e:
                     logger.exception(
                         f'room{room.id}: exception occurred while checking for status')
-            time.sleep(0.1)
+                time.sleep(0.1)
+            time.sleep(0.5)
         logger.info('monitor thread stopped')
 
     def shutdown(self, signalnum, frame):

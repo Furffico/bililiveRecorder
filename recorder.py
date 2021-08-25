@@ -1,10 +1,32 @@
 import os
 import pickle
 import logging
+import signal
+
 from main.Liveroom import LiveRoom
 from main.Monitor import Monitor
-import signal
-import time
+
+dockerconfig = """\
+[BASIC]
+; 使用docker运行时以下三项都不需要更改
+saveroot=/data/downloads
+temppath=/data/tmp
+history=/data
+; Bark App的推送地址，可以留空
+; barkurl=https://api.day.app/<key>/
+
+; 房间配置（可以有不止一个） 
+; 例：
+[bilibiliLive] ; 房间的标识符
+; 直播间的id，必填
+roomid=1
+; 保存录播的路径（为全局配置中saveroot的子目录），默认为房间的标识符
+savefolder=哔哩哔哩直播
+; 请求直播状态的最少间隔（单位秒，默认为60）
+updateinterval=60
+; 是否(yes/no)启用监听和录播，默认为yes
+activated=yes
+"""
 
 
 def readHistory(path):
@@ -60,7 +82,8 @@ def cleartempDir(path):
     if not os.path.isdir(HISTORYPATH):
         os.mkdir(HISTORYPATH)
 
-    createFlvcheckThreads(config['BASIC'].get('flecheckercount', 1),HISTORYPATH)
+    createFlvcheckThreads(config['BASIC'].get(
+        'flecheckercount', 1), HISTORYPATH)
     FlvCheckThread.q.join()
     FlvCheckThread.onexit()
 
@@ -90,6 +113,10 @@ def runfromConfig(path):
     if not os.path.isdir(HISTORYPATH):
         os.mkdir(HISTORYPATH)
     history = readHistory(HISTORYPATH)
+
+    barkurl = config['BASIC'].get('barkurl', '')
+    if barkurl:
+        LiveRoom.setNotification(barkurl)
 
     # 读取房间
     r = []
@@ -173,25 +200,7 @@ def run():
     if configpath:
         if not args.config and not os.path.isfile(os.getenv('CONFIGPATH')):
             # 用docker运行时配置文件不在指定的位置
-            open(os.getenv('CONFIGPATH'),'w').write("""\
-[BASIC]
-; 使用docker运行时以下三项都不需要更改
-saveroot=/data/downloads
-temppath=/data/tmp
-history=/data
-
-; 房间配置（可以有不止一个） 
-; 例：
-[bilibiliLive] ; 房间的标识符
-; 直播间的id，必填
-roomid=1
-; 保存录播的路径（为全局配置中saveroot的子目录），默认为房间的标识符
-savefolder=哔哩哔哩直播
-; 请求直播状态的最少间隔（单位秒，默认为60）
-updateinterval=60
-; 是否(yes/no)启用监听和录播，默认为yes
-activated=yes
-            """)
+            open(os.getenv('CONFIGPATH'), 'w').write(dockerconfig)
             logger.warning('请按照说明配置好挂载目录下的config.ini后再运行这个容器。')
             logger.info('program exited')
             quit()
