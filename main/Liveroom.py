@@ -1,11 +1,11 @@
 import time
-import requests
+import asyncio
 import logging
 import os
 import re
+import httpx
 
 from .Recorder import Recorder
-from .FlvCheckThread import FlvCheckThread
 
 logger = logging.getLogger('monitor')
 
@@ -50,9 +50,10 @@ def _formatDuration(duration: float):
 
 class LiveRoom():
     overrideDynamicInterval = False
+    recording_tasks = []
+    running = True
 
     def __init__(self, roomid, code, savefolder, updateInterval=60, history=None, tmpfolder=None):
-
         self.id = roomid
         self.code = code
         self._savefolder = savefolder
@@ -60,10 +61,12 @@ class LiveRoom():
         self.history = history or [0]*144
         self._baseUpdateInterval = updateInterval
 
-        self._roomInfo = {}
-        self._username = None
+        self._livetitle = None
+        self._username = self._getUserName()
         self.onair = False
-        self.recordThread = None
+        self.recorder = None
+        self.recordTask = None
+        self.isRecording = False
 
     @property
     def _headers(self):
@@ -74,111 +77,6 @@ class LiveRoom():
             'Referer': f'https://live.bilibili.com/blanc/{self.id}',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0'
         }
-
-    def _getUserName(self):
-        # 获取用户名
-        response = requests.get(
-            "https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room?roomid={}".format(
-                self.id),
-            timeout=10, headers=self._headers
-        ).json()
-        self._username = response['data']['info']['uname']
-        logger.info(f'{self.code}: Retrieved username {self._username}')
-
-    def _updateStatus(self):
-        # 获取房间基本信息及是否开播
-        response = requests.get(
-            "https://api.live.bilibili.com/room/v1/Room/get_info?id={}".format(
-                self.id),
-            timeout=10, headers=self._headers
-        ).json()
-        self._roomInfo = {
-            key: response['data'][key]
-            for key in ['room_id', 'live_status', 'title', 'description', 'uid']
-        }
-        self.onair = self._roomInfo['live_status'] == 1
-
-    def _getLiveUrl(self):
-        # 获取推流链接
-        if not self.onair:
-            logger.info(f'{self.code} is not on air.')
-            return None
-
-        # 推流码率
-        rates = requests.get(
-            "https://api.live.bilibili.com/room/v1/Room/playUrl?cid={}&quality=0&platform=web".format(
-                self._roomInfo['room_id']),
-            timeout=10, headers=self._headers
-        ).json()['data']['quality_description']
-        self._roomInfo['live_rates'] = {
-            rate['qn']: rate['desc'] for rate in rates}
-        qn = max(self._roomInfo['live_rates'])
-
-        # 推流链接
-        response = requests.get(
-            "https://api.live.bilibili.com/room/v1/Room/playUrl?cid={}&quality={}&platform=web".format(
-                self._roomInfo['room_id'], qn),
-            timeout=10, headers=self._headers
-        ).json()
-        url = response['data']['durl'][0]['url']
-        return url
-
-    def startRecording(self):
-        if not self.onair:
-            logger.info(f'{self.code} is not on air.')
-            return None
-        if not self._username:
-            self._getUserName()
-        url = self._getLiveUrl()
-        if not os.path.isdir(self._tmpfolder):
-            os.mkdir(self._tmpfolder)
-        filename = '{room_id}-{username}-{time}-{endtime}-{title}'.format(
-            **self._roomInfo,
-            username=self._username,
-            time=time.strftime('%y%m%d%H%M%S'),
-            endtime='{endtime}'
-        )
-
-        # 防止标题和用户名中含有windows路径的非法字符
-        filename = re.sub(r'[\<\>\:\"\\\'\\\/\|\?\*\.]', '', filename)+'.flv'
-        self.notifyAtBeginning()
-        self.recordThread = Recorder(
-            url=url,
-            savepath=os.path.join(self._tmpfolder, filename),
-            threadid=self.code,
-            room=self
-        )
-        self.recordThread.start()
-
-    def report(self) -> float:
-        # 返回值为现在距下一次检查的时间
-        if self.recordThread:
-            if self.recordThread.isRecording():
-                logger.info('{}: {} downloaded.'.format(
-                    self.code, _dataunitConv(self.recordThread.downloaded)))
-                return 10  # report status after 10 sec
-            else:
-                del self.recordThread
-                self.recordThread = None
-                return 5 # 防止因网络问题导致断流
-        else:
-            interval = self.updateInterval
-            logger.info(
-                f'{self.code}: updating status with interval {interval:.3f}s.')
-            try:
-                self._updateStatus()
-            except requests.exceptions:
-                logger.error(
-                    f'{self.code}: Requests\' exception encountered, retry after 60s.')
-                return 60
-            else:
-                logger.info(f'{self.code}: status updated.')
-                if self.onair:
-                    logger.info(f'{self.code}: start recording.')
-                    self.startRecording()
-                    return 10
-                else:
-                    return interval
 
     @property
     def updateInterval(self):
@@ -191,10 +89,113 @@ class LiveRoom():
                 t = _dividePeriod(time.time())
                 return 300*(self._baseUpdateInterval / 300)**(self.history[t]/max(self.history))
 
-    def recordingFinished(self, path, datasize, sttime, endtime):
+    def _getUserName(self):
+        # 获取用户名
+        response = httpx.get(
+            f"https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room?roomid={self.id}",
+            timeout=10, headers=self._headers
+        )
+        username = response.json()['data']['info']['uname']
+        logger.info(f'{self.code}: Retrieved username {username}')
+        return username
+
+    async def _updateStatus(self):
+        # 获取房间基本信息及是否开播
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://api.live.bilibili.com/room/v1/Room/get_info?id={self.id}",
+                timeout=10, headers=self._headers
+            )
+        response = response.json()
+        self.onair = response['data']['live_status'] == 1
+        if self.onair:
+            self._livetitle = response['data']['title']
+
+    async def _getLiveUrl(self):
+        # 获取推流链接
+        if not self.onair:
+            logger.info(f'{self.code} is not on air.')
+            return None
+
+        # 推流码率
+        async with httpx.AsyncClient() as client:
+            rates = await client.get(
+                f"https://api.live.bilibili.com/room/v1/Room/playUrl?cid={self.id}&quality=0&platform=web",
+                timeout=10, headers=self._headers
+            )
+        liverates = {rate['qn']: rate['desc']
+                     for rate in rates.json()['data']['quality_description']}
+        qn = max(liverates)
+
+        # 推流链接
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://api.live.bilibili.com/room/v1/Room/playUrl?cid={self.id}&quality={qn}&platform=web",
+                timeout=10, headers=self._headers
+            )
+        url = response.json()['data']['durl'][0]['url']
+        return url
+
+    async def record(self):
+        if not self.onair:
+            logger.info(f'{self.code} is not on air.')
+            return
+
+        self.isRecording = True
+        # url, temppath = await self.preRecording()
+        # dsize, starttime, endtime = await self.recording(url, temppath)
+        # await self.postRecording(temppath, dsize, starttime, endtime)
+        # self.isRecording = False
+        # self.recordTask = None
+
+        #! 录前准备
+        url = await self._getLiveUrl()
+        notifyTask = asyncio.create_task(self.notifyAtBeginning())
+
+        if not os.path.isdir(self._tmpfolder):
+            os.mkdir(self._tmpfolder)
+
+        filename = '{id}-{username}-{starttime}-{endtime}-{title}.tmp.flv'.format(
+            id=self.id,
+            username=self._username,
+            starttime=time.strftime('%y%m%d%H%M%S'),
+            endtime='{endtime}',
+            title=self._livetitle
+        )
+
+        # 防止标题和用户名中含有windows路径的非法字符
+        filename = re.sub(r'[\<\>\:\"\\\'\\\/\|\?\*]', '', filename)
+        temppath = os.path.join(self._tmpfolder, filename)
+
+        #! 录制中
+        self.recorder = Recorder(
+            url=url,
+            savepath=temppath,
+            threadid=self.code,
+            roomid=self.id
+        )
+        sttime = time.time()
+        try:
+            await self.recorder.record()
+        except asyncio.CancelledError:
+            logger.info(f"{self.code}: task cancelled.")
+        else:
+            logger.info(f"{self.code}: live terminated.")
+        endtime = time.time()
+
+        #! 录制结束
+        notifyTask.cancel()
+        datasize = self.recorder.downloaded
+        del self.recorder
+        self.recorder = None
+        path = temppath
+        logger.info(
+            f'{self.code}: recorder stopped, {_dataunitConv(datasize)} downloaded.')
+
         if datasize < 65536:  # 64KB
             os.remove(path)  # 删除过小的文件
         else:
+            await self.notifyAtEnd(endtime-sttime, datasize)
             # note live history
             st = _dividePeriod(sttime)
             end = _dividePeriod(endtime)
@@ -205,58 +206,86 @@ class LiveRoom():
 
             if not os.path.isdir(self._savefolder):
                 os.mkdir(self._savefolder)
-            filename = os.path.basename(path).format(
-                endtime=time.strftime('%H%M%S', time.localtime(endtime)))
-            temppath = os.path.join(self._tmpfolder, filename)
-            saveto = os.path.join(self._savefolder, filename)
-            if self._tmpfolder == self._savefolder:
-                temppath = temppath[:-4]+".tmp.flv"
 
-            os.rename(path, temppath)
+            temppath = path.format(endtime=time.strftime(
+                '%H%M%S', time.localtime(endtime)))
+            saveto = os.path.join(self._savefolder, os.path.basename(temppath))
+            os.rename(path, saveto)
+        logger.info(f'{self.code}: postprocessing completed')
 
-            self.notifyAtEnd(endtime-sttime, datasize)
-
-            logger.info(f'{self.code}: enqueue FlvCheck task.')
-            FlvCheckThread.addTask(temppath, saveto)
-            
-
-    def notifyAtBeginning(self):
+    async def notifyAtBeginning(self):
         pass
 
-    def notifyAtEnd(self, duration, filesize):
+    async def notifyAtEnd(self, duration, filesize):
+        pass
+
+    async def notifyAtBeginningWrapped(self):
         pass
 
     @classmethod
     def setNotification(cls, barkurl):
-        def pushMessage(title, msg):
+        async def pushMessage(title, msg):
             logger.info(
-                f"sending message to {barkurl}:\n title:{title} \n{msg}")
+                f"sending message to {barkurl}\ntitle: {title}\ncontent:\n{msg}")
             try:
-                req = requests.post(barkurl, data={
-                    "title": title,
-                    "body": msg,
-                    "group": "recorder"
-                })
+                async with httpx.AsyncClient() as client:
+                    req = await client.post(barkurl, data={
+                        "title": title,
+                        "body": msg,
+                        "group": "recorder"
+                    }, timeout=10)
             except:
-                logger.warning("error occurred when sending message.")
+                logger.exception(
+                    "error occurred when sending message.", exc_info=True)
             else:
                 logger.info(f"received data: {req.text}")
 
-        def notifyAtBeginning(self):
-            pushMessage("录播姬", startNotice.format(
-                name=self._username or self.code,
-                id=self.id,
-                title=self._roomInfo['title']
-            ))
+        async def notifyAtBeginning(self):
+            try:
+                await asyncio.sleep(5)
+                # 5秒后检查是否还在录制
+                if self.isRecording:
+                    await pushMessage("录播姬", startNotice.format(
+                        name=self._username or self.code,
+                        id=self.id,
+                        title=self._livetitle
+                    ))
+            except asyncio.CancelledError:
+                pass
 
-        def notifyAtEnd(self, duration, filesize):
-            pushMessage("录播姬", endNotice.format(
-                name=self._username or self.code,
-                id=self.id,
-                title=self._roomInfo["title"],
-                filesize=_dataunitConv(filesize),
-                duration=_formatDuration(duration)
-            ))
+        async def notifyAtEnd(self, duration, filesize):
+            try:
+                await pushMessage("录播姬", endNotice.format(
+                    name=self._username or self.code,
+                    id=self.id,
+                    title=self._livetitle,
+                    filesize=_dataunitConv(filesize),
+                    duration=_formatDuration(duration)
+                ))
+            except asyncio.CancelledError:
+                pass
 
         cls.notifyAtBeginning = notifyAtBeginning
         cls.notifyAtEnd = notifyAtEnd
+
+    async def report(self):
+        interval = 10
+        if self.isRecording:
+            logger.info(
+                f'{self.code}: {_dataunitConv(self.recorder.downloaded)} downloaded.')
+        else:
+            logger.info(f'{self.code}: updating status')
+            try:
+                await self._updateStatus()
+            except:
+                logger.error(
+                    f'{self.code}: Exception encountered, retry after 10s.')
+            else:
+                if self.onair:
+                    logger.info(f'{self.code}: creating coroutine.')
+                    self.recordTask = asyncio.create_task(self.record())
+                else:
+                    interval = self.updateInterval
+                    logger.info(
+                        f'{self.code}: next update is scheduled in {interval:.3f} sec.')
+        return interval

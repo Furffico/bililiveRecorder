@@ -1,81 +1,67 @@
+import asyncio
 import logging
-import time
 import os
 import pickle
 from queue import PriorityQueue
-import threading
-
-from .FlvCheckThread import FlvCheckThread
-from .Recorder import Recorder
+import signal
+import time
 
 logger = logging.getLogger('monitor')
 
 
-def createFlvcheckThreads(count=1, historypath=None):
-    # 创建时间戳校准进程
-    for _ in range(count):
-        a = FlvCheckThread()
-        a.start()
-
-    # 读取未完成的时间戳校准
-    if historypath:
-        queuepath = os.path.join(historypath, 'queue.pkl')
-        if os.path.isfile(queuepath):
-            with open(queuepath, 'rb') as f:
-                unfinished = pickle.load(f)
-            for temppath, saveto in unfinished:
-                if os.path.isfile(temppath):
-                    logger.info(
-                        f'Enqueue unfinished FlvCheck task:\n    {temppath} -> {saveto}')
-                    FlvCheckThread.addTask(temppath, saveto)
-
-
 class Monitor:
-    def __init__(self, rooms, flvcheckercount=1, cleanTerminate=False, historypath=None):
+    def __init__(self, rooms, historypath=None):
         if len(rooms) == 0:
             raise Exception('list for Liverooms is empty')
         self.rooms = rooms
-        createFlvcheckThreads(flvcheckercount, historypath)
-        self.cleanTerminate = cleanTerminate
         self.historypath = historypath
-        self.event = threading.Event()
+        self.running = True
+        self.sleeptask = None
 
     def run(self):
-        logger.info('monitor thread running')
+        for sig in [signal.SIGINT, signal.SIGHUP, signal.SIGTERM]:
+            signal.signal(sig, self.cleanup)
+        asyncio.run(self.mainloop())
+
+    async def mainloop(self):
+        logger.info('main thread running')
+
         q = PriorityQueue()
-        t = time.time()+3
+        t = time.time()
         for index in range(len(self.rooms)):
+            t += 3
             q.put((t, index))
         logger.info('The process will begin after 3 seconds')
 
-        while not self.event.is_set():
+        while self.running:
             schedule, roomindex = q.get()
             t = time.time()
             if t < schedule:
-                self.event.wait(schedule-t)
-                if self.event.is_set():
+                try:
+                    self.sleeptask = asyncio.create_task(
+                        asyncio.sleep(schedule-t))
+                    await self.sleeptask
+                except asyncio.CancelledError:
                     break
-            
+                self.sleeptask = None
+
             room = self.rooms[roomindex]
             try:
-                interval = room.report()
+                interval = await room.report()
             except Exception as e:
-                logger.exception(f'room{room.id}: exception occurred')
-                logger.info(f'room{room.id}: retry after 60 seconds.')
+                logger.exception(
+                    f'room{room.id}: exception occurred, retry after 60 seconds.')
                 interval = 60
             q.put((time.time()+interval, roomindex))
-            self.event.wait(0.1)
 
-        logger.info('monitor thread stopped')
+        await asyncio.sleep(0.4)
+        logger.info('main thread stopped')
 
-    def shutdown(self, signalnum, frame):
-        self.event.set()
+    def cleanup(self, a, b):
         logger.info('Program terminating')
-        Recorder.onexit()
-        if self.cleanTerminate:
-            logger.info('waiting for flvcheck thread')
-            FlvCheckThread.q.join()
-        FlvCheckThread.onexit()
+        for r in self.rooms:
+            if r.recordTask:
+                r.recordTask.cancel()
 
         logger.info('Storing history')
         if self.historypath:
@@ -90,11 +76,7 @@ class Monitor:
                 OrgHistory[r.id] = r.history
             with open(his, 'wb') as f:
                 pickle.dump(OrgHistory, f)
-            l = list(FlvCheckThread.getQueue())
-            if l:
-                logger.info('Remaining FlvCheck tasks:\n' +
-                            '\n'.join((f"    {i} -> {j}" for i, j in l)))
-            with open(os.path.join(self.historypath, 'queue.pkl'), 'wb') as f:
-                pickle.dump(l, f)
-            
-        logger.info('Program terminated')
+
+        self.running = False
+        if self.sleeptask:
+            self.sleeptask.cancel()

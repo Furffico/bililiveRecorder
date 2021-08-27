@@ -8,7 +8,7 @@ COPY ./recorder.py ./requirements.txt /app/
 COPY ./main /app/main
 
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apk/repositories && \
-    apk add -U tzdata && \
+    apk add -U --no-cache tzdata && \
     cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
     apk del tzdata
 
