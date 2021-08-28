@@ -63,10 +63,8 @@ class LiveRoom():
 
         self._livetitle = None
         self._username = self._getUserName()
-        self.onair = False
         self.recorder = None
         self.recordTask = None
-        self.isRecording = False
 
     @property
     def _headers(self):
@@ -107,16 +105,12 @@ class LiveRoom():
                 timeout=10, headers=self._headers
             )
         response = response.json()
-        self.onair = response['data']['live_status'] == 1
-        if self.onair:
+        isonair = response['data']['live_status'] == 1
+        if isonair:
             self._livetitle = response['data']['title']
+        return isonair
 
     async def _getLiveUrl(self):
-        # 获取推流链接
-        if not self.onair:
-            logger.info(f'{self.code} is not on air.')
-            return None
-
         # 推流码率
         async with httpx.AsyncClient() as client:
             rates = await client.get(
@@ -137,20 +131,8 @@ class LiveRoom():
         return url
 
     async def record(self):
-        if not self.onair:
-            logger.info(f'{self.code} is not on air.')
-            return
-
-        self.isRecording = True
-        # url, temppath = await self.preRecording()
-        # dsize, starttime, endtime = await self.recording(url, temppath)
-        # await self.postRecording(temppath, dsize, starttime, endtime)
-        # self.isRecording = False
-        # self.recordTask = None
-
         #! 录前准备
         url = await self._getLiveUrl()
-        notifyTask = asyncio.create_task(self.notifyAtBeginning())
 
         if not os.path.isdir(self._tmpfolder):
             os.mkdir(self._tmpfolder)
@@ -166,6 +148,8 @@ class LiveRoom():
         # 防止标题和用户名中含有windows路径的非法字符
         filename = re.sub(r'[\<\>\:\"\\\'\\\/\|\?\*]', '', filename)
         temppath = os.path.join(self._tmpfolder, filename)
+
+        notifyTask = asyncio.create_task(self.notifyAtBeginning())
 
         #! 录制中
         self.recorder = Recorder(
@@ -188,14 +172,15 @@ class LiveRoom():
         datasize = self.recorder.downloaded
         del self.recorder
         self.recorder = None
-        path = temppath
+
         logger.info(
             f'{self.code}: recorder stopped, {_dataunitConv(datasize)} downloaded.')
 
         if datasize < 65536:  # 64KB
-            os.remove(path)  # 删除过小的文件
+            os.remove(temppath)  # 删除过小的文件
         else:
-            await self.notifyAtEnd(endtime-sttime, datasize)
+            if self.running:
+                await self.notifyAtEnd(endtime-sttime, datasize)
             # note live history
             st = _dividePeriod(sttime)
             end = _dividePeriod(endtime)
@@ -207,19 +192,16 @@ class LiveRoom():
             if not os.path.isdir(self._savefolder):
                 os.mkdir(self._savefolder)
 
-            temppath = path.format(endtime=time.strftime(
-                '%H%M%S', time.localtime(endtime)))
-            saveto = os.path.join(self._savefolder, os.path.basename(temppath))
-            os.rename(path, saveto)
+            saveto = os.path.join(self._savefolder, os.path.basename(temppath).format(endtime=time.strftime(
+                '%H%M%S', time.localtime(endtime))))
+            os.rename(temppath, saveto)
+
         logger.info(f'{self.code}: postprocessing completed')
 
     async def notifyAtBeginning(self):
         pass
 
     async def notifyAtEnd(self, duration, filesize):
-        pass
-
-    async def notifyAtBeginningWrapped(self):
         pass
 
     @classmethod
@@ -232,11 +214,10 @@ class LiveRoom():
                     req = await client.post(barkurl, data={
                         "title": title,
                         "body": msg,
-                        "group": "recorder"
+                        "group": "录播姬"
                     }, timeout=10)
             except:
-                logger.exception(
-                    "error occurred when sending message.", exc_info=True)
+                logger.exception("error occurred when sending message.")
             else:
                 logger.info(f"received data: {req.text}")
 
@@ -244,12 +225,11 @@ class LiveRoom():
             try:
                 await asyncio.sleep(5)
                 # 5秒后检查是否还在录制
-                if self.isRecording:
-                    await pushMessage("录播姬", startNotice.format(
-                        name=self._username or self.code,
-                        id=self.id,
-                        title=self._livetitle
-                    ))
+                await pushMessage("录播姬", startNotice.format(
+                    name=self._username or self.code,
+                    id=self.id,
+                    title=self._livetitle
+                ))
             except asyncio.CancelledError:
                 pass
 
@@ -262,7 +242,7 @@ class LiveRoom():
                     filesize=_dataunitConv(filesize),
                     duration=_formatDuration(duration)
                 ))
-            except asyncio.CancelledError:
+            except asyncio.exceptions.CancelledError:  # 如果是人为结束程序就不发消息了
                 pass
 
         cls.notifyAtBeginning = notifyAtBeginning
@@ -270,18 +250,19 @@ class LiveRoom():
 
     async def report(self):
         interval = 10
-        if self.isRecording:
-            logger.info(
-                f'{self.code}: {_dataunitConv(self.recorder.downloaded)} downloaded.')
+        if self.recordTask:
+            if self.recorder:
+                logger.info(
+                    f'{self.code}: {_dataunitConv(self.recorder.downloaded)} downloaded.')
         else:
             logger.info(f'{self.code}: updating status')
             try:
-                await self._updateStatus()
+                isonair = await self._updateStatus()
             except:
                 logger.error(
                     f'{self.code}: Exception encountered, retry after 10s.')
             else:
-                if self.onair:
+                if isonair:
                     logger.info(f'{self.code}: creating coroutine.')
                     self.recordTask = asyncio.create_task(self.record())
                 else:

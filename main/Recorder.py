@@ -1,28 +1,9 @@
 import httpx
 import logging
 from .flv_checker import Flv
+import asyncio
 
 logger = logging.getLogger('recorder')
-
-
-class AsyncStreamContextManager():
-    def __init__(self, method, url, chunk_size=1024, **kwargs):
-        self.chunk_size = chunk_size
-        self.method = method
-        self.url = url
-        self.kwargs = kwargs
-        self.stream = None
-
-    async def __aenter__(self):
-        logger.info("entering awith")
-        self.stream = AsyncStreamHandler(
-            self.method, self.url, self.chunk_size, **self.kwargs)
-        return self.stream
-
-    async def __aexit__(self, *exc_info,):
-        logger.info("exiting awith")
-        if self.stream:
-            return await self.stream.close()
 
 
 class AsyncStreamHandler():
@@ -35,7 +16,7 @@ class AsyncStreamHandler():
         self._iter = iterator
 
     async def getnextChunk(self):
-        i = await self._iter.__anext__()
+        i = await asyncio.wait_for(self._iter.__anext__(), timeout=5)  # 等待五秒钟
         self.downloaded += len(i)
         return i
 
@@ -43,7 +24,7 @@ class AsyncStreamHandler():
         if self._this is None:
             try:
                 self._this = await self.getnextChunk()
-            except StopAsyncIteration:
+            except (StopAsyncIteration, asyncio.TimeoutError):
                 return b''
         end = self._pos+bytescount
         if end < len(self._this):
@@ -53,21 +34,49 @@ class AsyncStreamHandler():
         else:
             # 超出了缓存中的block
             data = self._this[self._pos:]
-            bytesleft = bytescount-len(data)
+            self._pos = bytescount-len(data)
+            try:
+                self._this = await self.getnextChunk()
+            except (StopAsyncIteration, asyncio.TimeoutError):
+                self._this = None
+            else:
+                data += self._this[:self._pos]
+        self.absolutepos += len(data)
+        return data
+
+    async def directWrite(self, bytescount, dest):
+        if self._this is None:
+            try:
+                self._this = await self.getnextChunk()
+            except StopAsyncIteration:
+                return b''
+        end = self._pos + bytescount
+        if end < len(self._this):
+            # 没有超出缓存中的block
+            dest.write(self._this[self._pos:end])
+            self._pos = end
+            count = bytescount
+        else:
+            # 超出了缓存中的block
+            dest.write(self._this[self._pos:])
+            count = len(self._this)-self._pos
+            bytesleft = bytescount-count
             required_count = bytesleft // self._chunk_size
             try:
                 for _ in range(required_count):
                     # 获取required_count个的block
-                    data += await self.getnextChunk()
+                    block = await self.getnextChunk()
+                    count += len(block)
+                    dest.write(block)
                 # 再获取一个存入this
                 self._this = await self.getnextChunk()
             except StopAsyncIteration:
                 self._this = None
             else:
                 self._pos = bytesleft-required_count*self._chunk_size
-                data += self._this[:self._pos]
-        self.absolutepos += len(data)
-        return data
+                dest.write(self._this[:self._pos])
+                count += self._pos
+        self.absolutepos += count
 
 
 class Recorder:
@@ -95,8 +104,18 @@ class Recorder:
                     iterator = response.aiter_bytes(chunk_size=1048576)
                     self.stream = AsyncStreamHandler(
                         iterator, chunk_size=1048576)
-                    flv = Flv()
-                    await flv.check(self.stream, file)
+                    try:
+                        flv = Flv()
+                        await flv.check(self.stream, file)
+                    except asyncio.TimeoutError:
+                        logger.error(f"{self.threadid}: Access Timeout")
+                    except StopAsyncIteration:
+                        pass
+                    except Exception as e:
+                        logger.exception(
+                            f"{self.threadid}: Exception occurred while recording.")
+                    finally:
+                        del flv
             del self.stream
             self.stream = None
 

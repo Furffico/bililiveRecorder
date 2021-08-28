@@ -52,6 +52,8 @@ class Monitor:
                 logger.exception(
                     f'room{room.id}: exception occurred, retry after 60 seconds.')
                 interval = 60
+            except asyncio.CancelledError:
+                break
             q.put((time.time()+interval, roomindex))
 
         await asyncio.sleep(0.4)
@@ -61,10 +63,15 @@ class Monitor:
         logger.info('Program terminating')
         for r in self.rooms:
             if r.recordTask:
+                r.running = False
                 r.recordTask.cancel()
 
-        logger.info('Storing history')
+        self.running = False
+        if self.sleeptask:
+            self.sleeptask.cancel()
+
         if self.historypath:
+            logger.info('Storing history')
             his = os.path.join(self.historypath, 'history.pkl')
             if os.path.isfile(his):
                 with open(his, 'rb') as f:
@@ -74,9 +81,6 @@ class Monitor:
 
             for r in self.rooms:
                 OrgHistory[r.id] = r.history
+
             with open(his, 'wb') as f:
                 pickle.dump(OrgHistory, f)
-
-        self.running = False
-        if self.sleeptask:
-            self.sleeptask.cancel()
